@@ -1,0 +1,49 @@
+# Build artifacts
+build/
+dist/
+*.o
+*.obj
+*.a
+*.so
+*.ilk
+*.pdb
+*.dSYM
+bin/
+nsphere
+nsphere.exe
+nsphere_plot
+nsphere_animations
+nsphere_distributions
+nsphere_2d_histograms
+
+# Runtime data/results/logs
+data/
+results/
+log/
+init/
+lastparams*.dat
+
+# Documentation build outputs
+docs/build/
+docs/doxygen/
+docs/source/_build/
+docs/.doctrees/
+docs/.buildinfo*
+
+# Python cache
+__pycache__/
+*.py[cod]
+# Python Virtual Environment
+venv/
+
+# OS generated files
+.DS_Store
+__MACOSX/
+Thumbs.db
+.ipynb_checkpoints/
+
+# IDE specific files
+.vscode/
+.idea/
+*.swp
+

@@ -1,0 +1,24 @@
+name: Validate CITATION.cff & README Consistency
+
+on: [push, pull_request]
+
+jobs:
+  check-citation-files:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+          # No pip caching needed/configured for just PyYAML
+
+      - name: Install validation dependencies
+        run: pip install --quiet pyyaml cffconvert
+
+      - name: Validate CITATION.cff via command line
+        run: cffconvert --validate
+
+      - name: Check README arXiv ID vs CITATION.cff arXiv ID
+        run: python dev/tools/scripts/check_readme_citation.py

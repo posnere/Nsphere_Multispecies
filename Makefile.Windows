@@ -1,0 +1,317 @@
+# Windows-specific Makefile for NSphere
+# Defines build settings for Windows platforms, supporting both CLANG64 and MSVC.
+
+# ================================================================
+# --- Directory Definitions ---
+# ================================================================
+ROOT_DIR = .
+BIN_DIR = bin
+C_SRC_DIR = src/c
+PY_SRC_DIR = src/python
+# --- End Directory Definitions ---
+
+# ================================================================
+# --- Configuration Settings ---
+# ================================================================
+
+# ------------------------------------------------------------------
+# Default build switches
+# ------------------------------------------------------------------
+# ------------------------------------------------------------------
+# Default tool-chain: MSYS2 CLANG64 + OpenMP (can be overridden)
+# ------------------------------------------------------------------
+USE_CLANG        ?= 1     # Default to CLANG64 environment
+CC               ?= clang # Default compiler for CLANG environment
+ifndef USE_MSVC
+    ifeq ($(USE_CLANG),1)
+        USE_MSVC = 0
+    else
+        USE_MSVC = 1
+    endif
+else
+    # If USE_MSVC is set, ensure USE_CLANG reflects it
+    ifeq ($(USE_MSVC),1)
+        USE_CLANG = 0
+    else
+        USE_CLANG = 1
+    endif
+endif
+
+# Compiler selection
+
+# Debug configuration
+DEBUG ?= no
+
+# Library paths - must be adjusted to match the Windows installation
+GSL_DIR = /clang64
+FFTW_DIR = /clang64
+
+# ================================================================
+# --- CLANG64 Configuration ---
+# ================================================================
+ifeq ($(USE_CLANG),1)
+
+    # CLANG64 Debug Configuration
+    ifeq ($(DEBUG),yes)
+        DEBUG_FLAGS = -g -fsanitize=address,undefined # Standard debug flags for CLANG64 builds
+        BUILD_TYPE = Debug build
+    else
+        DEBUG_FLAGS =
+        BUILD_TYPE = Release build
+        CFLAGS_OPT = -O3 -march=native # Optimization only for release builds
+    endif
+
+    # CLANG64 OpenMP Detection
+    # Explicitly use CC or fallback to clang inside the shell command
+    # Use POSIX /dev/null redirection and rm -f for cleanup
+    _TEST_CC := $(or $(CC),clang) # Use Makefile's CC if set, else clang
+    _TEST_RM := rm -f
+    OPENMP_TEST_FILE := openmp_test_$(shell date +%s)
+    OPENMP_TEST_SRC := $(OPENMP_TEST_FILE).c
+    OPENMP_TEST_EXE := $(OPENMP_TEST_FILE).exe
+    OPENMP_AVAILABLE := $(shell echo '#include <omp.h>' > $(OPENMP_TEST_SRC) && \
+                            echo 'int main() { return omp_get_max_threads(); }' >> $(OPENMP_TEST_SRC) && \
+                            $(_TEST_CC) -fopenmp $(OPENMP_TEST_SRC) -o $(OPENMP_TEST_EXE) > /dev/null 2>&1; \
+                            if [ $$? -eq 0 ]; then echo yes; else echo no; fi; \
+                            $(_TEST_RM) $(OPENMP_TEST_SRC) $(OPENMP_TEST_EXE) )
+
+    # OpenMP Configuration based on detection result
+    ifeq ($(OPENMP_AVAILABLE),yes)
+        OPENMP_FLAGS = -fopenmp
+        OPENMP_LDFLAGS = -lomp # LLVM OpenMP runtime
+        OPENMP_DEFINE = -D_OPENMP # Define standard macro if OpenMP used
+        OPENMP_STATUS = OpenMP detected and enabled (CLANG64).
+    else
+        OPENMP_FLAGS =
+        OPENMP_LDFLAGS =
+        OPENMP_DEFINE =
+        OPENMP_STATUS = OpenMP NOT detected (CLANG64). Performance will be limited.
+    endif
+
+
+    # CLANG64 Compiler Flags
+    # Includes optimization, OpenMP support, and Windows-specific settings
+    CFLAGS = $(CFLAGS_OPT) $(OPENMP_FLAGS) $(DEBUG_FLAGS) -funroll-loops -ffast-math -Wall -Wextra -Wno-macro-redefined
+    CFLAGS += -I$(GSL_DIR)/include -I$(FFTW_DIR)/include -I$(C_SRC_DIR)
+    CFLAGS += -D_WIN32 $(OPENMP_DEFINE) # Add conditional OpenMP define
+
+    # CLANG64 Linker Configuration
+    LDFLAGS = -L$(GSL_DIR)/lib -L$(FFTW_DIR)/lib
+    LDFLAGS += -lgsl -lgslcblas -lfftw3 -lfftw3_threads -lm
+    LDFLAGS += $(DEBUG_FLAGS) # Add -g
+# Debug linker flags are included via DEBUG_FLAGS
+
+    # Target and Build Configuration
+    TARGET = nsphere.exe
+    # Define for info purposes, but execute directly below
+    _BUILD_CMD_INFO = $(CC) $(CFLAGS) $(SRC) -o $(ROOT_DIR)/$(TARGET) $(LDFLAGS)
+    CLEAN_CMD = $(RM) $(ROOT_DIR)/$(TARGET) $(BIN_DIR)/$(TARGET) *.o $(subst \,/,$(PY_TARGETS_ROOT)) $(subst \,/,$(PY_TARGETS_BIN)) openmp_test.*
+    COMPILER_INFO = CLANG64 ($(CC))
+
+# ================================================================
+# --- MSVC Configuration ---
+# ================================================================
+else
+    CC = cl
+
+    # MSVC Debug Configuration
+    ifeq ($(DEBUG),yes)
+        DEBUG_FLAGS = /Zi /fsanitize=address
+        BUILD_TYPE = Debug build
+        CFLAGS_OPT = /Od # Optimization disabled for better debugging
+    else
+        DEBUG_FLAGS =
+        BUILD_TYPE = Release build
+        CFLAGS_OPT = /O2 /arch:AVX2 # Full optimization for release builds
+    endif
+
+    # MSVC OpenMP Detection
+    # Creates a small test program to check if OpenMP is supported by the MSVC compiler
+    OPENMP_AVAILABLE := $(shell if echo #include ^<omp.h^>^nint main() { return omp_get_max_threads(); } > openmp_test.c && $(CC) /openmp openmp_test.c /Fe:openmp_test.exe /link $(DEBUG_FLAGS) > NUL 2>&1 && del openmp_test.c openmp_test.exe openmp_test.obj openmp_test.ilk openmp_test.pdb > NUL 2>&1; then echo yes; else echo no; fi)
+
+    # OpenMP Configuration based on detection result
+    ifeq ($(OPENMP_AVAILABLE),yes)
+        OPENMP_FLAGS = /openmp
+        OPENMP_STATUS = OpenMP detected and enabled (MSVC).
+    else
+        OPENMP_FLAGS =
+        OPENMP_STATUS = OpenMP NOT detected (MSVC). Performance will be limited.
+    endif
+
+    # MSVC Compiler Flags
+    # Includes MSVC-specific optimization, OpenMP support, and Windows-specific settings
+    CFLAGS = $(CFLAGS_OPT) /fp:fast $(OPENMP_FLAGS) $(DEBUG_FLAGS) /W4
+    CFLAGS += /I"$(GSL_DIR)\include" /I"$(FFTW_DIR)\include" /I"$(C_SRC_DIR)"
+    CFLAGS += /D "_WIN32" /D "_CRT_SECURE_NO_WARNINGS"
+
+    # MSVC Linker Configuration
+    LDFLAGS = /LIBPATH:"$(GSL_DIR)\lib" /LIBPATH:"$(FFTW_DIR)\lib"
+    LDFLAGS += gsl.lib gslcblas.lib fftw3.lib fftw3_threads.lib
+    LDFLAGS += $(DEBUG_FLAGS) # DEBUG_FLAGS includes /Zi and /fsanitize=address for MSVC link
+
+    # Target and Build Configuration
+    TARGET = nsphere.exe
+    OBJ = nsphere.obj
+    # Define for info purposes, but execute directly below
+    _BUILD_CMD_INFO = $(CC) $(CFLAGS) /c $(SRC) /Fo$(OBJ) && $(CC) $(OBJ) /Fe$(ROOT_DIR)/$(TARGET) $(LDFLAGS)
+    CLEAN_CMD = del /Q $(ROOT_DIR)\$(TARGET) $(BIN_DIR)\$(TARGET) $(OBJ) *.pdb *.ilk $(subst /,\,$(PY_TARGETS_ROOT)) $(subst /,\,$(PY_TARGETS_BIN)) openmp_test.* 2>NUL || echo No files to clean.
+    COMPILER_INFO = MSVC (cl.exe)
+endif
+
+# Source files
+SRC = $(C_SRC_DIR)/nsphere.c
+
+# --- Python Executable Definitions ---
+PY_SCRIPTS = nsphere_plot.py nsphere_animations.py nsphere_distributions.py nsphere_2d_histograms.py
+PY_SRCS = $(addprefix $(PY_SRC_DIR)/, $(PY_SCRIPTS))
+PY_TARGETS_ROOT = $(patsubst %.py,$(ROOT_DIR)/%, $(notdir $(PY_SCRIPTS)))
+PY_TARGETS_BIN = $(patsubst %.py,$(BIN_DIR)/%, $(notdir $(PY_SCRIPTS)))
+# --- End Python Definitions ---
+
+# Build rules
+all: $(TARGET) nsphere_plot nsphere_animations nsphere_distributions nsphere_2d_histograms
+
+
+
+# Build the target (Main Rule)
+$(ROOT_DIR)/$(TARGET): $(SRC)
+ifeq ($(OPENMP_AVAILABLE),no)
+	@printf '\n\033[1;33mBuild Warning: OpenMP not detected. Proceeding without OpenMP flags. Performance will be limited.\033[0m\n\n' # Use printf
+endif
+	@echo "Building $(TARGET) ($(BUILD_TYPE))..."
+	@# Build command uses CFLAGS/LDFLAGS which are already conditional based on OPENMP_AVAILABLE
+ifeq ($(USE_CLANG),1)
+	@$(CC) $(CFLAGS) $(SRC) -o $@ $(LDFLAGS)
+else
+	@$(CC) $(CFLAGS) /c $(SRC) /Fo$(OBJ) && $(CC) $(OBJ) /Fe$@ $(LDFLAGS)
+endif
+	@# Conditional mkdir & cp
+ifeq ($(USE_CLANG),1)
+	@mkdir -p $(BIN_DIR)
+	@$(CP) $@ $(subst \,/,$(BIN_DIR)/$(TARGET))
+else
+	@if not exist $(subst /,\\,$(BIN_DIR)) mkdir $(subst /,\\,$(BIN_DIR))
+	@$(CP) $@ $(subst /,\\,$(BIN_DIR)/$(TARGET))
+endif
+	@echo "Build complete: $@ and $(BIN_DIR)/$(TARGET)"
+
+# Build explicitly without OpenMP, regardless of availability
+# Note: Respects DEBUG=yes if passed on command line
+no-openmp: python_executables
+	@printf '\n\033[1;33mWarning: Explicitly building without OpenMP (single-threaded mode)\033[0m\n' # Use printf
+	@printf 'This will significantly reduce performance.\n' # Use printf
+	@echo "----------------------------------------------------------"
+	@read -p "Continue without OpenMP? [Y/n] " answer && \
+	case "$$answer" in \
+	    [nN]) echo "Build aborted by user."; exit 1 ;; \
+	    *) echo "Proceeding without OpenMP..."; ;; \
+	esac
+	@echo "----------------------------------------------------------"
+	@echo "Building $(TARGET) without OpenMP ($(BUILD_TYPE))..."
+ifeq ($(USE_CLANG),1)
+	@# Define NO_OMP flags specifically for CLANG64
+	$(eval NO_OMP_CFLAGS = $(CFLAGS_OPT) $(DEBUG_FLAGS) -funroll-loops -ffast-math -Wall -Wextra -Wno-macro-redefined -I$(GSL_DIR)/include -I$(FFTW_DIR)/include -I$(C_SRC_DIR) -D_WIN32)
+	$(eval NO_OMP_LDFLAGS = -L$(GSL_DIR)/lib -L$(FFTW_DIR)/lib -lgsl -lgslcblas -lfftw3 -lfftw3_threads -lm $(DEBUG_FLAGS))
+	@$(CC) $(NO_OMP_CFLAGS) $(SRC) -o $(ROOT_DIR)/$(TARGET) $(NO_OMP_LDFLAGS)
+else
+	@# Define NO_OMP flags specifically for MSVC
+	$(eval NO_OMP_CFLAGS = $(CFLAGS_OPT) /fp:fast $(DEBUG_FLAGS) /W4 /I"$(GSL_DIR)\include" /I"$(FFTW_DIR)\include" /I"$(C_SRC_DIR)" /D "_WIN32" /D "_CRT_SECURE_NO_WARNINGS")
+	$(eval NO_OMP_LDFLAGS = /LIBPATH:"$(GSL_DIR)\lib" /LIBPATH:"$(FFTW_DIR)\lib" gsl.lib gslcblas.lib fftw3.lib fftw3_threads.lib $(DEBUG_FLAGS))
+	@$(CC) $(NO_OMP_CFLAGS) /c $(SRC) /Fo$(OBJ) && $(CC) $(OBJ) /Fe$(ROOT_DIR)/$(TARGET) $(NO_OMP_LDFLAGS)
+endif
+	@# Conditional mkdir & cp
+ifeq ($(USE_CLANG),1)
+	@mkdir -p $(BIN_DIR)
+	@$(CP) $(ROOT_DIR)/$(TARGET) $(subst \,/,$(BIN_DIR)/$(TARGET))
+else
+	@if not exist $(subst /,\\,$(BIN_DIR)) mkdir $(subst /,\\,$(BIN_DIR))
+	@$(CP) $(ROOT_DIR)/$(TARGET) $(subst /,\\,$(BIN_DIR)/$(TARGET))
+endif
+	@echo "Build complete (without OpenMP): $(ROOT_DIR)/$(TARGET) and $(BIN_DIR)/$(TARGET)"
+
+	@# Clean up build files
+clean:
+	@echo Cleaning up...
+ifeq ($(USE_CLANG),1)
+	@# --- CLANG64 Clean ---
+	@# Use direct shell commands for maximum reliability
+	-rm -f $(ROOT_DIR)/nsphere.exe $(BIN_DIR)/nsphere.exe *.o openmp_test.*
+	-rm -f $(ROOT_DIR)/nsphere_plot $(ROOT_DIR)/nsphere_animations $(ROOT_DIR)/nsphere_distributions $(ROOT_DIR)/nsphere_2d_histograms
+	-rm -f $(BIN_DIR)/nsphere_plot $(BIN_DIR)/nsphere_animations $(BIN_DIR)/nsphere_distributions $(BIN_DIR)/nsphere_2d_histograms
+	-rm -rf $(BIN_DIR) || true
+else
+	@# --- MSVC Clean ---
+	@# Use direct shell commands for maximum reliability
+	-del /Q /F $(ROOT_DIR)\nsphere.exe $(BIN_DIR)\nsphere.exe *.obj openmp_test.* *.pdb *.ilk 2>NUL || true
+	-del /Q /F $(ROOT_DIR)\nsphere_plot.exe $(ROOT_DIR)\nsphere_animations.exe $(ROOT_DIR)\nsphere_distributions.exe $(ROOT_DIR)\nsphere_2d_histograms.exe 2>NUL || true 
+	-del /Q /F $(BIN_DIR)\nsphere_plot.exe $(BIN_DIR)\nsphere_animations.exe $(BIN_DIR)\nsphere_distributions.exe $(BIN_DIR)\nsphere_2d_histograms.exe 2>NUL || true
+	-if exist $(subst /,\\,$(BIN_DIR)) rmdir /S /Q $(subst /,\\,$(BIN_DIR)) 2>NUL || true
+endif
+	@echo Clean finished.
+
+# Help target
+help:
+	@echo Windows Makefile for NSphere
+	@echo ====================================
+	@echo ""
+	@echo "Usage:"
+	@echo "  USE_MSVC=1   - Build with MSVC / cl.exe instead of CLANG64"
+	@echo "  nmake /f Makefile.Windows.txt [DEBUG=yes]     # Build with MSVC (Release default)"
+	@echo "  mingw32-make -f Makefile.Windows.txt USE_CLANG=1 [DEBUG=yes] # Build with CLANG64 (Release default)"
+	@echo ""
+	@echo "Targets:"
+	@echo "  all          - Build with OpenMP if available (default)"
+	@echo "  no-openmp    - Build without OpenMP support (single-threaded)"
+	@echo "  python_executables - Build only Python executables"
+	@echo "  clean        - Remove build files"
+	@echo "  help         - Display this help message"
+	@echo ""
+	@echo "Build options:"
+	@echo "  DEBUG=yes    - Build with debug symbols and AddressSanitizer"
+	@echo "                 (Requires compatible compiler: GCC/Clang or VS 2019 16.9+ for ASan)"
+	@echo "  USE_CLANG=1  - Use CLANG64 instead of MSVC (cl)"
+	@echo ""
+	@echo "Current build configuration:"
+	@echo "  Compiler: $(COMPILER_INFO)"
+	@echo "  Build Type: $(BUILD_TYPE)"
+	@echo "  OpenMP status: $(OPENMP_STATUS)"
+	@echo ""
+	@echo "Configuration:"
+	@echo "  Edit GSL_DIR and FFTW_DIR to match your Windows installation paths"
+	@echo ""
+
+# Define CP copy command if not passed from dispatcher
+ifndef CP
+  ifeq ($(USE_CLANG),1)
+      CP := cp -f
+  else
+      CP := copy
+  endif
+endif
+
+# ================================================================
+# --- Python Targets and Rules ---
+# ================================================================
+# Target to create Python executables
+.PHONY: python_executables
+python_executables: $(PY_TARGETS_ROOT) $(PY_TARGETS_BIN)
+	@echo Python executables are up to date.
+
+# Rule for creating root executable from source
+$(ROOT_DIR)/%: $(PY_SRC_DIR)/%.py
+	@echo Copying $< to $@
+	@$(CP) $(subst \,/,$<) $(subst \,/,$@)
+
+# Rule for creating bin executable from source
+$(BIN_DIR)/%: $(PY_SRC_DIR)/%.py
+	@echo Copying $< to $@
+	@mkdir -p $(BIN_DIR)
+	@$(CP) $(subst \,/,$<) $(subst \,/,$@)
+
+# Explicit dependencies
+$(foreach target,$(PY_TARGETS_ROOT),$(eval $(target): $(PY_SRC_DIR)/$(patsubst $(ROOT_DIR)/%,%.py,$(target))))
+$(foreach target,$(PY_TARGETS_BIN),$(eval $(target): $(PY_SRC_DIR)/$(patsubst $(BIN_DIR)/%,%.py,$(target))))
+# --- End Python Rules ---
+
+# Prevent phony targets from interfering with files of the same name
+.PHONY: all no-openmp clean help python_executables

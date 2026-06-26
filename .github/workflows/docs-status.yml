@@ -1,0 +1,25 @@
+name: docs
+
+on:
+  workflow_run:
+    workflows: ["pages-build-deployment"]
+    types:
+      - completed
+  # Allow manual triggering
+  workflow_dispatch:
+
+jobs:
+  check-deployment:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check deployment status
+        if: ${{ github.event.workflow_run.conclusion != 'success' && github.event_name != 'workflow_dispatch' }}
+        run: exit 1
+      - name: Set documentation status
+        run: |
+          echo "Documentation deployment successful!"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "Manual trigger detected - setting status to passing"
+          elif [[ "${{ github.event.workflow_run.conclusion }}" == "success" ]]; then
+            echo "Pages deployment successful - setting status to passing"
+          fi

@@ -1,0 +1,237 @@
+# Linux-specific Makefile for NSphere
+# Defines build settings optimized for Linux platforms.
+
+# ================================================================
+# --- Directory Definitions ---
+# ================================================================
+ROOT_DIR = .
+BIN_DIR = bin
+C_SRC_DIR = src/c
+PY_SRC_DIR = src/python
+# --- End Directory Definitions ---
+
+# Detect last-level cache and pass as -DQUAD_CACHE
+# Uses half L3 size, with a minimum of 256 KiB.
+HOST_L3_KB := $(shell awk '/^cache size/ {print $$4; exit}' /proc/cpuinfo 2>/dev/null || echo 6144)
+ifeq ($(strip $(HOST_L3_KB)),)
+    HOST_L3_KB := 6144                      # fallback 6 MiB if awk fails or returns empty
+endif
+# Use python to calculate half L3 in bytes, floor at 256KiB (262144)
+QUAD_CACHE_BYTES := $(shell python -c "import math, sys; sz = int(sys.argv[1]) * 1024 // 2; print(max(sz, 262144))" $(HOST_L3_KB))
+
+# ================================================================
+# --- Compiler Configuration ---
+# ================================================================
+CC = clang
+
+# --- OpenMP Detection ---
+# Determines if OpenMP is available by creating a test program and attempting to compile it.
+OPENMP_TEST_SRC := /tmp/openmp_test_$(shell date +%s%N).c
+OPENMP_TEST_BIN := /tmp/openmp_test_$(shell date +%s%N)
+OPENMP_AVAILABLE := $(shell printf "#include <omp.h>\nint main() { return omp_get_max_threads(); }" > $(OPENMP_TEST_SRC); \
+                    if $(CC) -fopenmp $(OPENMP_TEST_SRC) -o $(OPENMP_TEST_BIN) 2>/dev/null; then echo "yes"; else echo "no"; fi; \
+                    rm -f $(OPENMP_TEST_SRC) $(OPENMP_TEST_BIN) 2>/dev/null)
+
+# --- OpenMP Configuration ---
+# Sets flags and build status based on OpenMP availability.
+ifeq ($(OPENMP_AVAILABLE),yes)
+    OPENMP_FLAGS = -fopenmp
+    OPENMP_STATUS = OpenMP detected and enabled.
+    PROCEED_BUILD = yes
+else
+    OPENMP_FLAGS =
+    OPENMP_STATUS = OpenMP NOT detected. Performance will be limited.
+    PROCEED_BUILD = no
+endif
+
+# --- Debug Configuration ---
+# Sets debug flags and build type based on DEBUG variable.
+DEBUG ?= no
+ifeq ($(DEBUG),yes)
+    DEBUG_FLAGS = -g -fsanitize=address
+    BUILD_TYPE = Debug build
+else
+    DEBUG_FLAGS =
+    BUILD_TYPE = Release build
+endif
+
+# ================================================================
+# --- Compiler and Linker Flags ---
+# ================================================================
+
+# Compiler optimization flags for best performance with generated code
+CFLAGS = -Ofast \
+         -march=native \
+         -DQUAD_CACHE=$(QUAD_CACHE_BYTES) \
+         $(OPENMP_FLAGS) \
+         $(DEBUG_FLAGS) \
+         -funroll-loops \
+         -ffast-math \
+         -fno-finite-math-only \
+         -fno-math-errno \
+         -ffp-contract=fast \
+         -Wall -Wextra \
+         -I/usr/include \
+         -I$(C_SRC_DIR)
+
+# Linker configuration for required Linux libraries
+LDFLAGS = -L/usr/lib $(OPENMP_FLAGS) $(DEBUG_FLAGS)
+LDLIBS = -lgsl -lgslcblas -lm -lfftw3 -lfftw3_threads
+
+# --- Python Executable Definitions ---
+PY_SCRIPTS = nsphere_plot.py nsphere_animations.py nsphere_distributions.py nsphere_2d_histograms.py
+PY_SRCS = $(addprefix $(PY_SRC_DIR)/, $(PY_SCRIPTS))
+PY_TARGETS_ROOT = $(patsubst %.py,$(ROOT_DIR)/%, $(notdir $(PY_SCRIPTS)))
+PY_TARGETS_BIN = $(patsubst %.py,$(BIN_DIR)/%, $(notdir $(PY_SCRIPTS)))
+# --- End Python Definitions ---
+
+# Target configuration
+TARGET = nsphere
+SRC = $(C_SRC_DIR)/nsphere.c
+
+# ================================================================
+# --- Build Rules ---
+# ================================================================
+
+# Default target - checks OpenMP, then conditionally builds target
+all: check-openmp build-if-proceed python_executables
+
+# Builds the executable, but only when PROCEED_BUILD=yes
+build-if-proceed: $(ROOT_DIR)/$(TARGET)
+
+# Main target builds the executable
+$(ROOT_DIR)/$(TARGET): $(SRC) Makefile 
+ifeq ($(PROCEED_BUILD),yes)
+	@echo "Building $(TARGET) ($(BUILD_TYPE))..."
+	@echo "$(CC) $(CFLAGS) $(SRC) -o $@ $(LDFLAGS) $(LDLIBS)"
+	@$(CC) $(CFLAGS) $(SRC) -o $@ $(LDFLAGS) $(LDLIBS)
+	@mkdir -p $(BIN_DIR)
+	cp $@ $(BIN_DIR)/$(TARGET)
+	chmod +x $@ $(BIN_DIR)/$(TARGET)
+	@echo "Build complete: $@ and $(BIN_DIR)/$(TARGET)"
+endif
+
+# ================================================================
+# --- OpenMP Check Rule ---
+# ================================================================
+# Verifies OpenMP availability and prompts user to continue if not available
+check-openmp:
+ifeq ($(OPENMP_AVAILABLE),no)
+	@echo ""
+	@echo "\033[1;33mWarning: $(OPENMP_STATUS)\033[0m"
+	@echo "This will significantly reduce performance."
+	@echo "To enable OpenMP, please install the required packages:"
+	@echo "  - For Ubuntu/Debian: sudo apt-get install libomp-dev"
+	@echo "  - For Fedora: sudo dnf install libomp-devel"
+	@echo "  - For Arch: sudo pacman -S openmp"
+	@echo "----------------------------------------------------------"
+	@read -p "Continue without OpenMP? [y/N] " answer && \
+	case "$$answer" in \
+		[yY]*) echo "Proceeding without OpenMP..."; \
+		       $(MAKE) --no-print-directory -s PROCEED_BUILD=yes build-if-proceed ;; \
+		*) echo "Build aborted by user."; exit 1 ;; \
+	esac
+	@echo "----------------------------------------------------------"
+else
+	@echo "\033[1;32m$(OPENMP_STATUS)\033[0m"
+endif
+
+# ================================================================
+# --- Configuration for Single-Threaded Build ---
+# ================================================================
+# Flag set for explicitly requested non-OpenMP builds
+NO_OMP_CFLAGS = -Ofast -march=native -funroll-loops -ffast-math -fno-finite-math-only -fno-math-errno -ffp-contract=fast -Wall -Wextra -I/usr/include -I$(C_SRC_DIR)
+NO_OMP_LDFLAGS = -L/usr/lib
+
+# ================================================================
+# --- Additional Build Targets ---
+# ================================================================
+
+# Debug build target - invokes main build with DEBUG=yes
+debug:
+	@echo "Building in debug mode with AddressSanitizer..."
+	@$(MAKE) --no-print-directory DEBUG=yes
+
+# Explicit no-OpenMP target - builds without OpenMP support regardless of availability
+no-openmp: python_executables
+	@echo ""
+	@echo "\033[1;33mWarning: Explicitly building without OpenMP (single-threaded mode)\033[0m"
+	@echo "This will significantly reduce performance."
+	@echo "----------------------------------------------------------"
+	@read -p "Continue without OpenMP? [Y/n] " answer && \
+	case "$$answer" in \
+		[nN]) echo "Build aborted by user."; exit 1 ;; \
+		*) echo "Proceeding without OpenMP..."; ;; \
+	esac
+	@echo "----------------------------------------------------------"
+	@echo "Building $(TARGET) without OpenMP ($(BUILD_TYPE))..."
+	@echo "$(CC) $(NO_OMP_CFLAGS) $(SRC) -o $(ROOT_DIR)/$(TARGET) $(NO_OMP_LDFLAGS) $(LDLIBS)"
+	@$(CC) $(NO_OMP_CFLAGS) $(SRC) -o $(ROOT_DIR)/$(TARGET) $(NO_OMP_LDFLAGS) $(LDLIBS)
+	@mkdir -p $(BIN_DIR)
+	cp $(ROOT_DIR)/$(TARGET) $(BIN_DIR)/$(TARGET)
+	chmod +x $(ROOT_DIR)/$(TARGET) $(BIN_DIR)/$(TARGET)
+	@echo "Build complete (without OpenMP): $(ROOT_DIR)/$(TARGET) and $(BIN_DIR)/$(TARGET)"
+
+# Clean target - removes all generated files
+clean:
+	@echo "Cleaning up for Linux..."
+	rm -f $(ROOT_DIR)/$(TARGET) $(BIN_DIR)/$(TARGET) *.o \
+	     $(PY_TARGETS_ROOT) $(PY_TARGETS_BIN) \
+	     /tmp/openmp_test_* openmp_test.* 2>/dev/null || true
+	-@rmdir $(BIN_DIR) 2>/dev/null || true # Try removing bin dir
+
+# ================================================================
+# --- Python Targets and Rules ---
+# ================================================================
+# Target to create Python executables
+.PHONY: python_executables
+python_executables: $(PY_TARGETS_ROOT) $(PY_TARGETS_BIN)
+	@echo "Python executables are up to date."
+
+# Rule for creating root executable from source
+$(ROOT_DIR)/%: $(PY_SRC_DIR)/%.py
+	@echo "Copying $< to $@"
+	cp $< $@
+	chmod +x $@
+
+# Rule for creating bin executable from source
+$(BIN_DIR)/%: $(PY_SRC_DIR)/%.py
+	@echo "Copying $< to $@"
+	@mkdir -p $(BIN_DIR) # Ensure bin exists
+	cp $< $@
+	chmod +x $@
+
+# Explicit dependencies
+$(foreach target,$(PY_TARGETS_ROOT),$(eval $(target): $(PY_SRC_DIR)/$(patsubst $(ROOT_DIR)/%,%.py,$(target))))
+$(foreach target,$(PY_TARGETS_BIN),$(eval $(target): $(PY_SRC_DIR)/$(patsubst $(BIN_DIR)/%,%.py,$(target))))
+# --- End Python Rules ---
+
+# --- Help and Information ---
+# ================================================================
+# Displays usage information and current build configuration
+help:
+	@echo "NSphere Makefile Help"
+	@echo "============================"
+	@echo ""
+	@echo "Available targets:"
+	@echo "  make                  - Build with OpenMP if available (default)"
+	@echo "  make no-openmp        - Build explicitly without OpenMP"
+	@echo "  make debug            - Build with debug symbols and AddressSanitizer"
+	@echo "  make clean            - Remove build files" 
+	@echo "  make help             - Display this help message"
+	@echo ""
+	@echo "Build options (make DEBUG=yes ...):"
+	@echo "  DEBUG=yes             - Build with debug symbols and AddressSanitizer"
+	@echo ""
+	@echo "Current build configuration:"
+	@echo "  OpenMP status: $(OPENMP_STATUS)"
+	@echo "  Build type: $(BUILD_TYPE)"
+	@echo ""
+	@echo "Compiler: $(CC)"
+	@echo "CFLAGS: $(CFLAGS)"
+	@echo ""
+	@echo "Example: make DEBUG=yes        # Build with debug flags"
+	@echo ""
+
+# Prevent phony targets from interfering with files of the same name
+.PHONY: all check-openmp build-if-proceed no-openmp debug clean help python_executables

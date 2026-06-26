@@ -1,0 +1,188 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Welcome to NSphere&#39;s Documentation! &mdash; NSphere  documentation</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=e59714d7" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script crossorigin="anonymous" integrity="sha256-Ae2Vz/4ePdIu6ZyI/5ZGsYnb+m0JlOmKPjt6XZ9JJkA=" src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.4/require.min.js"></script>
+      <script>window.MathJax = {"tex": {"inlineMath": [["$", "$"], ["\\(", "\\)"]], "processEscapes": true}, "options": {"ignoreHtmlClass": "tex2jax_ignore|mathjax_ignore|document", "processHtmlClass": "tex2jax_process|mathjax_process|math|output_area"}}</script>
+      <script defer="defer" src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="Command-Line Usage" href="command_line/index.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="#" class="icon icon-home">
+            NSphere
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Contents:</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="command_line/index.html">Command-Line Usage</a></li>
+<li class="toctree-l1"><a class="reference internal" href="data_flow/index.html">Data and Results Flow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="data_flow/index.html#output-file-reference">Output File Reference</a></li>
+<li class="toctree-l1"><a class="reference internal" href="c_api/index.html">C API Reference</a></li>
+<li class="toctree-l1"><a class="reference internal" href="python_api/index.html">Python API Reference</a></li>
+<li class="toctree-l1"><a class="reference internal" href="examples/index.html">Examples</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="#">NSphere</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="#" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">Welcome to NSphere's Documentation!</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/index.rst.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="welcome-to-nsphere-s-documentation">
+<h1>Welcome to NSphere's Documentation!<a class="headerlink" href="#welcome-to-nsphere-s-documentation" title="Link to this heading"></a></h1>
+</section>
+<section id="overview">
+<h1>Overview<a class="headerlink" href="#overview" title="Link to this heading"></a></h1>
+<p>NSphere simulates the evolution of spherical self-gravitating systems, primarily targeting collisionless dark matter halos in astrophysics. It leverages the inherent spherical symmetry to simplify the complex 𝑁-body problem. By reducing the six-dimensional phase space (position and velocity) to three dimensions (radius <code class="docutils literal notranslate"><span class="pre">r</span></code>, radial velocity <code class="docutils literal notranslate"><span class="pre">𝑣ᵣ</span></code>, and angular momentum <code class="docutils literal notranslate"><span class="pre">ℓ</span></code> or velocity angle), the computational cost is significantly lowered. The core principle is self-consistency: the gravitational potential is generated by the mass distribution of all particles, and particles orbit within that potential. In equilibrium, such systems, described by a phase-space Distribution Function (DF) often dependent on energy (<code class="docutils literal notranslate"><span class="pre">ε</span></code>) and angular momentum (<code class="docutils literal notranslate"><span class="pre">ℓ</span></code>), are generally stable. NSphere provides a tool to efficiently explore how these systems evolve when perturbed or subjected to new physical processes (e.g., Self-Interacting Dark Matter (SIDM), central black hole growth, external tidal forces) where analytical solutions are intractable.</p>
+</section>
+<section id="numerical-implementation">
+<h1>Numerical Implementation<a class="headerlink" href="#numerical-implementation" title="Link to this heading"></a></h1>
+<p>The simulation evolves a system of 𝑁 particles, often representing concentric mass shells. The algorithm proceeds in discrete time steps. At each step:
+1.  <strong>Sorting:</strong> Particles are efficiently sorted by their radial coordinate <code class="docutils literal notranslate"><span class="pre">r</span></code>. This allows for rapid calculation of the mass enclosed within any radius, <code class="docutils literal notranslate"><span class="pre">M(r)</span></code>, which determines the gravitational force. The implementation utilizes optimized sorting algorithms like Quadsort, achieving nearly <code class="docutils literal notranslate"><span class="pre">𝑁</span> <span class="pre">log</span> <span class="pre">𝑁</span></code> or even linear scaling for the nearly-ordered data typical between steps.
+2.  <strong>Force Calculation:</strong> The gravitational force on each particle is calculated based solely on the mass <code class="docutils literal notranslate"><span class="pre">M(r)</span></code> enclosed within its current radius (Newton's Shell Theorem). Centrifugal force due to angular momentum (<code class="docutils literal notranslate"><span class="pre">ℓ²/r³</span></code>) is added.
+3.  <strong>Integration:</strong> Particle states (radius <code class="docutils literal notranslate"><span class="pre">r</span></code> and radial velocity <code class="docutils literal notranslate"><span class="pre">𝑣ᵣ</span></code>) are updated using a numerical integrator. NSphere employs adaptive leapfrog methods, automatically refining the time step for accuracy. For orbits with very low angular momentum approaching the center (<code class="docutils literal notranslate"><span class="pre">r</span></code> -&gt; 0), where standard integration becomes stiff, a Levi-Civita coordinate transformation (<code class="docutils literal notranslate"><span class="pre">ϱ</span> <span class="pre">=</span> <span class="pre">√(r)</span></code>) and fictitious time (<code class="docutils literal notranslate"><span class="pre">dτ</span> <span class="pre">=</span> <span class="pre">dt/r</span></code>) are used to regularize the equations of motion and improved stability and accuracy.</p>
+<p>This approach significantly reduces computational cost compared to traditional <code class="docutils literal notranslate"><span class="pre">𝑁²</span></code> 𝑁-body methods and mitigates issues like two-body relaxation effects, making it suitable for high-precision studies of spherical systems on standard hardware.</p>
+<p>For further details on the gravitational algorithm, see <a class="reference external" href="https://arxiv.org/abs/2504.13996">Kamionkowski &amp; Sigurdson (2025a)</a>. For complete details of the SIDM implementation, see <a class="reference external" href="https://arxiv.org/abs/2506.04334">Kamionkowski, Sigurdson &amp; Slone (2025)</a>. For the implementation and effects of anisotropic velocity distributions, see <a class="reference external" href="https://arxiv.org/abs/PLACEHOLDER">Kamionkowski &amp; Sigurdson (2025b)</a>.</p>
+</section>
+<section id="key-capabilities">
+<h1>Key Capabilities<a class="headerlink" href="#key-capabilities" title="Link to this heading"></a></h1>
+<p>NSphere provides several advanced features for studying spherical dark matter systems:</p>
+<p><strong>Profile Support:</strong> Initial conditions can be generated for NFW (with power-law cutoff), Cored Plummer-like, or Hernquist density profiles. Each profile supports both isotropic and anisotropic velocity distributions.</p>
+<p><strong>Anisotropy Models:</strong> Velocity anisotropy can be configured using constant-β models (Hernquist only) or the Osipkov-Merritt model with radially-varying β(r) = r²/(r² + r_a²) (compatible with all profiles). Note that the <code class="docutils literal notranslate"><span class="pre">--writeinit</span></code> flag outputs initial conditions that, with external format conversion and augmentation by isotropic polar/azimuthal angles, may be used in other N-body codes.</p>
+<p><strong>SIDM Physics:</strong> Self-interacting dark matter scattering is implemented via direct Monte Carlo with configurable cross-section (σ/m). The parallel implementation uses graph-coloring to eliminate race conditions while maintaining high efficiency. SIDM simulations demonstrate core formation and eventual gravothermal collapse.</p>
+<p><strong>Restart &amp; Extension:</strong> Interrupted simulations can be resumed with <code class="docutils literal notranslate"><span class="pre">--sim-restart</span></code>, or completed simulations extended with <code class="docutils literal notranslate"><span class="pre">--sim-extend</span></code>, and will be bit-for-bit identical to simulations run normally for the desired end time.</p>
+<p><strong>Reproducibility:</strong> Comprehensive seed management (<code class="docutils literal notranslate"><span class="pre">--master-seed</span></code>, <code class="docutils literal notranslate"><span class="pre">--init-cond-seed</span></code>, <code class="docutils literal notranslate"><span class="pre">--sidm-seed</span></code>, <code class="docutils literal notranslate"><span class="pre">--load-seeds</span></code>) enables exact reproduction of stochastic processes. All seeds are saved automatically for each run.</p>
+</section>
+<section id="getting-started">
+<h1>Getting Started<a class="headerlink" href="#getting-started" title="Link to this heading"></a></h1>
+<p>Run a basic simulation and generate plots:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>./nsphere<span class="w"> </span>--nparticles<span class="w"> </span><span class="m">10000</span><span class="w"> </span>--tfinal<span class="w"> </span><span class="m">5</span>
+./nsphere_plot
+</pre></div>
+</div>
+<p>For SIDM physics with core formation:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>./nsphere<span class="w"> </span>--nparticles<span class="w"> </span><span class="m">10000</span><span class="w"> </span>--tfinal<span class="w"> </span><span class="m">20</span><span class="w"> </span>--sidm<span class="w"> </span>--sidm-kappa<span class="w"> </span><span class="m">50</span>
+./nsphere_animations
+</pre></div>
+</div>
+<p>See the <a class="reference internal" href="command_line/index.html"><span class="doc">Command-Line Usage</span></a> section for all available options.</p>
+<p><em>(For more technical details, see the sections below)</em></p>
+<div class="toctree-wrapper compound">
+<p class="caption" role="heading"><span class="caption-text">Contents:</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="command_line/index.html">Command-Line Usage</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="command_line/index.html#n-spherical-shell-simulation-nsphere">N-Spherical Shell Simulation (<cite>nsphere</cite>)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="command_line/index.html#plotting-animation-nsphere-plot">Plotting &amp; Animation (<cite>nsphere_plot</cite>)</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="data_flow/index.html">Data and Results Flow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="data_flow/index.html#output-file-reference">Output File Reference</a></li>
+<li class="toctree-l1"><a class="reference internal" href="c_api/index.html">C API Reference</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="c_api/nsphere_core.html">NSphere Core (nsphere.c)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="c_api/nsphere_sort.html">NSphere Sort (nsphere_sort.h)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="c_api/quadsort.html">QuadSort (<cite>quadsort.c</cite> / <cite>quadsort.h</cite>)</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="python_api/index.html">Python API Reference</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="python_api/index.html#nsphere-plot-nsphere-plot-py">NSphere Plot (<cite>nsphere_plot.py</cite>)</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="examples/index.html">Examples</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="examples/notebooks/nsphere_notebook_example1.html">Visualization of NSphere Phase Space and Density Evolution</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/notebooks/nsphere_notebook_example2.html">SIDM Core Collapse Analysis, Visualization and Plots</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/notebooks/nsphere_notebook_example3.html">Anisotropic SIDM Halo Analysis</a></li>
+</ul>
+</li>
+</ul>
+</div>
+</section>
+<section id="indices-and-tables">
+<h1>Indices and tables<a class="headerlink" href="#indices-and-tables" title="Link to this heading"></a></h1>
+<ul class="simple">
+<li><p><a class="reference internal" href="genindex.html"><span class="std std-ref">Index</span></a></p></li>
+<li><p><a class="reference internal" href="py-modindex.html"><span class="std std-ref">Module Index</span></a></p></li>
+<li><p><a class="reference internal" href="search.html"><span class="std std-ref">Search Page</span></a></p></li>
+</ul>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="command_line/index.html" class="btn btn-neutral float-right" title="Command-Line Usage" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2025, Kris Sigurdson.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

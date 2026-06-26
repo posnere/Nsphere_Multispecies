@@ -1,0 +1,461 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>C API Reference &mdash; NSphere  documentation</title>
+      <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=e59714d7" />
+
+  
+      <script src="../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script crossorigin="anonymous" integrity="sha256-Ae2Vz/4ePdIu6ZyI/5ZGsYnb+m0JlOmKPjt6XZ9JJkA=" src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.4/require.min.js"></script>
+      <script>window.MathJax = {"tex": {"inlineMath": [["$", "$"], ["\\(", "\\)"]], "processEscapes": true}, "options": {"ignoreHtmlClass": "tex2jax_ignore|mathjax_ignore|document", "processHtmlClass": "tex2jax_process|mathjax_process|math|output_area"}}</script>
+      <script defer="defer" src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <script src="../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="NSphere Core (nsphere.c)" href="nsphere_core.html" />
+    <link rel="prev" title="Data and Results Flow" href="../data_flow/index.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../index.html" class="icon icon-home">
+            NSphere
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Contents:</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../command_line/index.html">Command-Line Usage</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../data_flow/index.html">Data and Results Flow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../data_flow/index.html#output-file-reference">Output File Reference</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">C API Reference</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html">NSphere Core (nsphere.c)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_sort.html">NSphere Sort (nsphere_sort.h)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quadsort.html">QuadSort (<cite>quadsort.c</cite> / <cite>quadsort.h</cite>)</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../python_api/index.html">Python API Reference</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/index.html">Examples</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../index.html">NSphere</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">C API Reference</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="../_sources/c_api/index.rst.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="c-api-reference">
+<h1>C API Reference<a class="headerlink" href="#c-api-reference" title="Link to this heading"></a></h1>
+<p>This section provides detailed documentation for the C components of NSphere, generated from source code comments using Doxygen and Breathe.</p>
+<div class="toctree-wrapper compound">
+<p class="caption" role="heading"><span class="caption-text">Contents:</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="nsphere_core.html">NSphere Core (nsphere.c)</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#c.CLEAN_EXIT"><code class="docutils literal notranslate"><span class="pre">CLEAN_EXIT</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#c.CLEAN_LOCAL_EXIT"><code class="docutils literal notranslate"><span class="pre">CLEAN_LOCAL_EXIT</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#c.cube"><code class="docutils literal notranslate"><span class="pre">cube</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#c.CUTOFF_FACTOR_CORED_DEFAULT"><code class="docutils literal notranslate"><span class="pre">CUTOFF_FACTOR_CORED_DEFAULT</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#c.CUTOFF_FACTOR_NFW_DEFAULT"><code class="docutils literal notranslate"><span class="pre">CUTOFF_FACTOR_NFW_DEFAULT</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#c.DEBUG_MAX_STEPS"><code class="docutils literal notranslate"><span class="pre">DEBUG_MAX_STEPS</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#c.DEBUG_PARTICLE_ID"><code class="docutils literal notranslate"><span class="pre">DEBUG_PARTICLE_ID</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#c.FALLOFF_FACTOR_NFW_DEFAULT"><code class="docutils literal notranslate"><span class="pre">FALLOFF_FACTOR_NFW_DEFAULT</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#c.G_CONST"><code class="docutils literal notranslate"><span class="pre">G_CONST</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#c.HALO_MASS"><code class="docutils literal notranslate"><span class="pre">HALO_MASS</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#c.HALO_MASS_NFW"><code class="docutils literal notranslate"><span class="pre">HALO_MASS_NFW</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#c.HIST_NBINS"><code class="docutils literal notranslate"><span class="pre">HIST_NBINS</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#c.IF_ALL_PART"><code class="docutils literal notranslate"><span class="pre">IF_ALL_PART</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#c.IF_DEBUG"><code class="docutils literal notranslate"><span class="pre">IF_DEBUG</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#c.IF_DYNPSI"><code class="docutils literal notranslate"><span class="pre">IF_DYNPSI</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#c.IF_DYNRANK"><code class="docutils literal notranslate"><span class="pre">IF_DYNRANK</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#c.imin"><code class="docutils literal notranslate"><span class="pre">imin</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#c.kmsec_to_kpcmyr"><code class="docutils literal notranslate"><span class="pre">kmsec_to_kpcmyr</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#c.MYBINIO_H"><code class="docutils literal notranslate"><span class="pre">MYBINIO_H</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#c.NUM_MINI_SUBSTEPS_BOOTSTRAP"><code class="docutils literal notranslate"><span class="pre">NUM_MINI_SUBSTEPS_BOOTSTRAP</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#c.PI"><code class="docutils literal notranslate"><span class="pre">PI</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#c.RADIX_BITS"><code class="docutils literal notranslate"><span class="pre">RADIX_BITS</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#c.RADIX_MASK"><code class="docutils literal notranslate"><span class="pre">RADIX_MASK</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#c.RADIX_SIZE"><code class="docutils literal notranslate"><span class="pre">RADIX_SIZE</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#c.RC"><code class="docutils literal notranslate"><span class="pre">RC</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#c.RC_NFW_DEFAULT"><code class="docutils literal notranslate"><span class="pre">RC_NFW_DEFAULT</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#c.sqr"><code class="docutils literal notranslate"><span class="pre">sqr</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#c.VEL_CONV_SQ"><code class="docutils literal notranslate"><span class="pre">VEL_CONV_SQ</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv413drhodr_func_t"><code class="docutils literal notranslate"><span class="pre">drhodr_func_t</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv417drhodr_nfw_func_t"><code class="docutils literal notranslate"><span class="pre">drhodr_nfw_func_t</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv420potential_function_t"><code class="docutils literal notranslate"><span class="pre">potential_function_t</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv429add_snapshot_to_double_bufferPPdPdPii"><code class="docutils literal notranslate"><span class="pre">add_snapshot_to_double_buffer()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv417adjust_ntimestepsiii"><code class="docutils literal notranslate"><span class="pre">adjust_ntimesteps()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv433allocate_double_precision_buffersi"><code class="docutils literal notranslate"><span class="pre">allocate_double_precision_buffers()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv427allocate_trajectory_buffersiiii"><code class="docutils literal notranslate"><span class="pre">allocate_trajectory_buffers()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv438append_all_particle_data_chunk_to_filePKciiPfPiPfPf"><code class="docutils literal notranslate"><span class="pre">append_all_particle_data_chunk_to_file()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv431append_all_particle_ids_to_filePKciiPi"><code class="docutils literal notranslate"><span class="pre">append_all_particle_ids_to_file()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv442append_all_particle_phi_data_chunk_to_filePKciiPf"><code class="docutils literal notranslate"><span class="pre">append_all_particle_phi_data_chunk_to_file()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv442append_all_particle_scatter_counts_to_filePKciiPi"><code class="docutils literal notranslate"><span class="pre">append_all_particle_scatter_counts_to_file()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv425calculate_system_energiesPPdidPdPd"><code class="docutils literal notranslate"><span class="pre">calculate_system_energies()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv426check_and_warn_negative_fQPP10gsl_interpPP16gsl_interp_accelPdPdPiPKcPKci"><code class="docutils literal notranslate"><span class="pre">check_and_warn_negative_fQ()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv425check_strict_monotonicityPKdiPKc"><code class="docutils literal notranslate"><span class="pre">check_strict_monotonicity()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv425cleanup_all_particle_datav"><code class="docutils literal notranslate"><span class="pre">cleanup_all_particle_data()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv426cleanup_trajectory_buffersii"><code class="docutils literal notranslate"><span class="pre">cleanup_trajectory_buffers()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv47cmp_LAIPKvPKv"><code class="docutils literal notranslate"><span class="pre">cmp_LAI()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv429compare_pair_by_first_elementPKvPKv"><code class="docutils literal notranslate"><span class="pre">compare_pair_by_first_element()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv423compare_partdata_by_radPKvPKv"><code class="docutils literal notranslate"><span class="pre">compare_partdata_by_rad()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv417compare_particlesPKvPKv"><code class="docutils literal notranslate"><span class="pre">compare_particles()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv423cored_potential_wrapperdPv"><code class="docutils literal notranslate"><span class="pre">cored_potential_wrapper()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv434correct_negative_fE_and_rebuild_IEPdPiPdPdiPKc"><code class="docutils literal notranslate"><span class="pre">correct_negative_fE_and_rebuild_IE()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv418create_backup_filePKc"><code class="docutils literal notranslate"><span class="pre">create_backup_file()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv412crossproduct11threevector11threevector"><code class="docutils literal notranslate"><span class="pre">crossproduct()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv427density_derivative_om_coredd"><code class="docutils literal notranslate"><span class="pre">density_derivative_om_cored()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv425density_derivative_om_nfwdddd"><code class="docutils literal notranslate"><span class="pre">density_derivative_om_nfw()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv417density_hernquistddd"><code class="docutils literal notranslate"><span class="pre">density_hernquist()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv418df_hernquist_anisodddd"><code class="docutils literal notranslate"><span class="pre">df_hernquist_aniso()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv427direct_gaussian_convolutionPKdiPKddPd"><code class="docutils literal notranslate"><span class="pre">direct_gaussian_convolution()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv418doAdaptiveFullLeapiiddddddidiPdPd"><code class="docutils literal notranslate"><span class="pre">doAdaptiveFullLeap()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv424doAdaptiveFullLeviCivitaiiddddiddidiPdPd"><code class="docutils literal notranslate"><span class="pre">doAdaptiveFullLeviCivita()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv420doLeviCivitaLeapfrogiiddddidPdPd"><code class="docutils literal notranslate"><span class="pre">doLeviCivitaLeapfrog()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv415doMicroLeapfrogiiddddiidPdPd"><code class="docutils literal notranslate"><span class="pre">doMicroLeapfrog()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv417doMicroLeviCivitaiidddidddPdPdPd"><code class="docutils literal notranslate"><span class="pre">doMicroLeviCivita()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv433doSingleTauStepAdaptiveLeviCivitaiiddddddiddiPdPdPd"><code class="docutils literal notranslate"><span class="pre">doSingleTauStepAdaptiveLeviCivita()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv410dotproduct11threevector11threevector"><code class="docutils literal notranslate"><span class="pre">dotproduct()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv410double_cmpPKvPKv"><code class="docutils literal notranslate"><span class="pre">double_cmp()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv46drhodrd"><code class="docutils literal notranslate"><span class="pre">drhodr()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv416drhodr_hernquistddd"><code class="docutils literal notranslate"><span class="pre">drhodr_hernquist()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv419drhodr_om_hernquistddd"><code class="docutils literal notranslate"><span class="pre">drhodr_om_hernquist()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv424drhodr_profile_nfwcutoffdddd"><code class="docutils literal notranslate"><span class="pre">drhodr_profile_nfwcutoff()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv411dRhoDtaufundd"><code class="docutils literal notranslate"><span class="pre">dRhoDtaufun()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv423effective_angular_forcedd"><code class="docutils literal notranslate"><span class="pre">effective_angular_force()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv429effective_angular_force_rho_vdd"><code class="docutils literal notranslate"><span class="pre">effective_angular_force_rho_v()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv412errorAndExitPKcPKcPKc"><code class="docutils literal notranslate"><span class="pre">errorAndExit()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv414evaluatesplineP10gsl_splineP16gsl_interp_acceld"><code class="docutils literal notranslate"><span class="pre">evaluatespline()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv428evaluatespline_with_boundaryP10gsl_splineP16gsl_interp_accelddddd"><code class="docutils literal notranslate"><span class="pre">evaluatespline_with_boundary()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv411fEintegranddPv"><code class="docutils literal notranslate"><span class="pre">fEintegrand()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv421fEintegrand_hernquistdPv"><code class="docutils literal notranslate"><span class="pre">fEintegrand_hernquist()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv415fEintegrand_nfwdPv"><code class="docutils literal notranslate"><span class="pre">fEintegrand_nfw()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv424fft_gaussian_convolutionPKdiPKddPd"><code class="docutils literal notranslate"><span class="pre">fft_gaussian_convolution()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv428finalize_debug_energy_outputv"><code class="docutils literal notranslate"><span class="pre">finalize_debug_energy_output()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv427finalize_energy_diagnosticsi"><code class="docutils literal notranslate"><span class="pre">finalize_energy_diagnostics()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv434find_last_common_complete_snapshotiiiiPKc"><code class="docutils literal notranslate"><span class="pre">find_last_common_complete_snapshot()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv428find_last_processed_snapshotPii"><code class="docutils literal notranslate"><span class="pre">find_last_processed_snapshot()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv426find_minimum_useful_radiusPFddPvEPvdd"><code class="docutils literal notranslate"><span class="pre">find_minimum_useful_radius()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv427flush_double_buffer_to_diskPKc"><code class="docutils literal notranslate"><span class="pre">flush_double_buffer_to_disk()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv424flush_trajectory_buffersiii"><code class="docutils literal notranslate"><span class="pre">flush_trajectory_buffers()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv410forceLCfuniidddd"><code class="docutils literal notranslate"><span class="pre">forceLCfun()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv416format_file_sizelPc6size_t"><code class="docutils literal notranslate"><span class="pre">format_file_size()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv411fprintf_binP4FILEPKcz"><code class="docutils literal notranslate"><span class="pre">fprintf_bin()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv415fprintf_bin_dblP4FILEPKcz"><code class="docutils literal notranslate"><span class="pre">fprintf_bin_dbl()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv410fscanf_binP4FILEPKcz"><code class="docutils literal notranslate"><span class="pre">fscanf_bin()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv414fscanf_bin_dblP4FILEPKcz"><code class="docutils literal notranslate"><span class="pre">fscanf_bin_dbl()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv420gaussian_convolutionPKdiPKddPd"><code class="docutils literal notranslate"><span class="pre">gaussian_convolution()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv434generate_ics_hernquist_anisotropicPPdiP7gsl_rngddPP10gsl_splinePP16gsl_interp_accelPP10gsl_splinePP16gsl_interp_accelPP10gsl_splinePP16gsl_interp_accelPP10gsl_interpPP16gsl_interp_accelPPdPPdPPdPPdPii"><code class="docutils literal notranslate"><span class="pre">generate_ics_hernquist_anisotropic()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv424get_available_disk_spacePKc"><code class="docutils literal notranslate"><span class="pre">get_available_disk_space()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv422get_deterministic_rand8uint64_tiii"><code class="docutils literal notranslate"><span class="pre">get_deterministic_rand()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv420get_sort_descriptionPKc"><code class="docutils literal notranslate"><span class="pre">get_sort_description()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv421get_suffixed_filenamePKciPc6size_t"><code class="docutils literal notranslate"><span class="pre">get_suffixed_filename()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv419gravitational_forcediidd"><code class="docutils literal notranslate"><span class="pre">gravitational_force()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv425gravitational_force_rho_vdiidd"><code class="docutils literal notranslate"><span class="pre">gravitational_force_rho_v()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv416handle_sidm_stepPPdidddiiPii"><code class="docutils literal notranslate"><span class="pre">handle_sidm_step()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv427hernquist_potential_wrapperdPv"><code class="docutils literal notranslate"><span class="pre">hernquist_potential_wrapper()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv415hyperg_2F1_safedd"><code class="docutils literal notranslate"><span class="pre">hyperg_2F1_safe()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv423insertion_parallel_sortPPdi"><code class="docutils literal notranslate"><span class="pre">insertion_parallel_sort()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv414insertion_sortPPdi"><code class="docutils literal notranslate"><span class="pre">insertion_sort()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv418insertion_sort_subPPdii"><code class="docutils literal notranslate"><span class="pre">insertion_sort_sub()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv47isFloatPKc"><code class="docutils literal notranslate"><span class="pre">isFloat()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv49isIntegerPKc"><code class="docutils literal notranslate"><span class="pre">isInteger()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv421load_chosen_particlesPKcPPiPiPPiPi"><code class="docutils literal notranslate"><span class="pre">load_chosen_particles()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv432load_existing_energy_diagnosticsPKci"><code class="docutils literal notranslate"><span class="pre">load_existing_energy_diagnostics()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv423load_from_double_bufferPKciiPPdiPi"><code class="docutils literal notranslate"><span class="pre">load_from_double_buffer()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv427load_particles_from_restartPKciPPdiiPi"><code class="docutils literal notranslate"><span class="pre">load_particles_from_restart()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv411log_messagePKcPKcz"><code class="docutils literal notranslate"><span class="pre">log_message()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv416make_threevectorddd"><code class="docutils literal notranslate"><span class="pre">make_threevector()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv424mass_integrand_hernquistdPv"><code class="docutils literal notranslate"><span class="pre">mass_integrand_hernquist()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv413massintegranddPv"><code class="docutils literal notranslate"><span class="pre">massintegrand()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv423massintegrand_hernquistdPv"><code class="docutils literal notranslate"><span class="pre">massintegrand_hernquist()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv431massintegrand_profile_nfwcutoffdPv"><code class="docutils literal notranslate"><span class="pre">massintegrand_profile_nfwcutoff()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv45mix648uint64_t"><code class="docutils literal notranslate"><span class="pre">mix64()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv421nfw_potential_wrapperdPv"><code class="docutils literal notranslate"><span class="pre">nfw_potential_wrapper()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv415om_mu_integranddPv"><code class="docutils literal notranslate"><span class="pre">om_mu_integrand()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv419parallel_radix_sortPPdi"><code class="docutils literal notranslate"><span class="pre">parallel_radix_sort()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv422parse_nsphere_filenamePKcPiPiPd"><code class="docutils literal notranslate"><span class="pre">parse_nsphere_filename()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv413parseSaveArgsiA_PcPi"><code class="docutils literal notranslate"><span class="pre">parseSaveArgs()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv422perform_scatter_updatePPdii8uint64_tii"><code class="docutils literal notranslate"><span class="pre">perform_scatter_update()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv443perform_sidm_scattering_parallel_graphcolorPPdidi8uint64_tPxddPi"><code class="docutils literal notranslate"><span class="pre">perform_sidm_scattering_parallel_graphcolor()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv430perform_sidm_scattering_serialPPdidi8uint64_tPxddPi"><code class="docutils literal notranslate"><span class="pre">perform_sidm_scattering_serial()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv419potential_hernquistddd"><code class="docutils literal notranslate"><span class="pre">potential_hernquist()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv410printUsagePKc"><code class="docutils literal notranslate"><span class="pre">printUsage()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv413prompt_yes_noPKc"><code class="docutils literal notranslate"><span class="pre">prompt_yes_no()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv412PsiintegranddPv"><code class="docutils literal notranslate"><span class="pre">Psiintegrand()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv422quadsort_parallel_sortPPdi"><code class="docutils literal notranslate"><span class="pre">quadsort_parallel_sort()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv416quadsort_wrapperPPdi"><code class="docutils literal notranslate"><span class="pre">quadsort_wrapper()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv423read_initial_conditionsPPdiPKc"><code class="docutils literal notranslate"><span class="pre">read_initial_conditions()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv427reassign_orig_ids_with_rankPdi"><code class="docutils literal notranslate"><span class="pre">reassign_orig_ids_with_rank()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv434retrieve_all_particle_phi_snapshotPKciiiPf"><code class="docutils literal notranslate"><span class="pre">retrieve_all_particle_phi_snapshot()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv430retrieve_all_particle_snapshotPKciiiPfPiPfPf"><code class="docutils literal notranslate"><span class="pre">retrieve_all_particle_snapshot()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv421save_chosen_particlesPKcPiiPii"><code class="docutils literal notranslate"><span class="pre">save_chosen_particles()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv410sigmatotaldidd"><code class="docutils literal notranslate"><span class="pre">sigmatotal()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv411sort_by_radP8PartDatai"><code class="docutils literal notranslate"><span class="pre">sort_by_rad()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv414sort_particlesPPdi"><code class="docutils literal notranslate"><span class="pre">sort_particles()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv423sort_particles_with_algPPdiPKc"><code class="docutils literal notranslate"><span class="pre">sort_particles_with_alg()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv418sort_rr_psi_arraysPdPdi"><code class="docutils literal notranslate"><span class="pre">sort_rr_psi_arrays()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv420stdlib_qsort_wrapperPPdi"><code class="docutils literal notranslate"><span class="pre">stdlib_qsort_wrapper()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv419store_debug_approxEidd"><code class="docutils literal notranslate"><span class="pre">store_debug_approxE()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv427store_debug_dynE_componentsiddddd"><code class="docutils literal notranslate"><span class="pre">store_debug_dynE_components()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv426truncate_files_to_snapshotiiiiiPKc"><code class="docutils literal notranslate"><span class="pre">truncate_files_to_snapshot()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv419verify_sort_resultsPPdiPKc"><code class="docutils literal notranslate"><span class="pre">verify_sort_results()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv424write_initial_conditionsPPdiPKc"><code class="docutils literal notranslate"><span class="pre">write_initial_conditions()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv46chosen"><code class="docutils literal notranslate"><span class="pre">chosen</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv411dbg_approxE"><code class="docutils literal notranslate"><span class="pre">dbg_approxE</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv49dbg_count"><code class="docutils literal notranslate"><span class="pre">dbg_count</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv48dbg_dynE"><code class="docutils literal notranslate"><span class="pre">dbg_dynE</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv48dbg_kinE"><code class="docutils literal notranslate"><span class="pre">dbg_kinE</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv48dbg_potE"><code class="docutils literal notranslate"><span class="pre">dbg_potE</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv410dbg_radius"><code class="docutils literal notranslate"><span class="pre">dbg_radius</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv48dbg_time"><code class="docutils literal notranslate"><span class="pre">dbg_time</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv424debug_direct_convolution"><code class="docutils literal notranslate"><span class="pre">debug_direct_convolution</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv410doReadInit"><code class="docutils literal notranslate"><span class="pre">doReadInit</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv411doWriteInit"><code class="docutils literal notranslate"><span class="pre">doWriteInit</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv418g_active_halo_mass"><code class="docutils literal notranslate"><span class="pre">g_active_halo_mass</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv417g_anisotropy_beta"><code class="docutils literal notranslate"><span class="pre">g_anisotropy_beta</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv426g_anisotropy_beta_provided"><code class="docutils literal notranslate"><span class="pre">g_anisotropy_beta_provided</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv420g_attempt_load_seeds"><code class="docutils literal notranslate"><span class="pre">g_attempt_load_seeds</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv417g_benchmark_count"><code class="docutils literal notranslate"><span class="pre">g_benchmark_count</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv425g_cored_profile_halo_mass"><code class="docutils literal notranslate"><span class="pre">g_cored_profile_halo_mass</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv418g_cored_profile_rc"><code class="docutils literal notranslate"><span class="pre">g_cored_profile_rc</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv427g_cored_profile_rmax_factor"><code class="docutils literal notranslate"><span class="pre">g_cored_profile_rmax_factor</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv419g_current_best_sort"><code class="docutils literal notranslate"><span class="pre">g_current_best_sort</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv433g_current_timestep_scatter_counts"><code class="docutils literal notranslate"><span class="pre">g_current_timestep_scatter_counts</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv421g_cutoff_factor_param"><code class="docutils literal notranslate"><span class="pre">g_cutoff_factor_param</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv430g_cutoff_factor_param_provided"><code class="docutils literal notranslate"><span class="pre">g_cutoff_factor_param_provided</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv415g_dbl_buf_count"><code class="docutils literal notranslate"><span class="pre">g_dbl_buf_count</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv422g_dbl_buf_current_slot"><code class="docutils literal notranslate"><span class="pre">g_dbl_buf_current_slot</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv411g_dbl_buf_L"><code class="docutils literal notranslate"><span class="pre">g_dbl_buf_L</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv414g_dbl_buf_npts"><code class="docutils literal notranslate"><span class="pre">g_dbl_buf_npts</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv413g_dbl_buf_phi"><code class="docutils literal notranslate"><span class="pre">g_dbl_buf_phi</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv411g_dbl_buf_R"><code class="docutils literal notranslate"><span class="pre">g_dbl_buf_R</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv414g_dbl_buf_Rank"><code class="docutils literal notranslate"><span class="pre">g_dbl_buf_Rank</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv414g_dbl_buf_Vrad"><code class="docutils literal notranslate"><span class="pre">g_dbl_buf_Vrad</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv421g_default_max_threads"><code class="docutils literal notranslate"><span class="pre">g_default_max_threads</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv416g_defaultSortAlg"><code class="docutils literal notranslate"><span class="pre">g_defaultSortAlg</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv425g_density_derivative_func"><code class="docutils literal notranslate"><span class="pre">g_density_derivative_func</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv429g_density_derivative_nfw_func"><code class="docutils literal notranslate"><span class="pre">g_density_derivative_nfw_func</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv419g_doAllParticleData"><code class="docutils literal notranslate"><span class="pre">g_doAllParticleData</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv49g_doDebug"><code class="docutils literal notranslate"><span class="pre">g_doDebug</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv410g_doDynPsi"><code class="docutils literal notranslate"><span class="pre">g_doDynPsi</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv411g_doDynRank"><code class="docutils literal notranslate"><span class="pre">g_doDynRank</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv411g_doRestart"><code class="docutils literal notranslate"><span class="pre">g_doRestart</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv416g_doRestartForce"><code class="docutils literal notranslate"><span class="pre">g_doRestartForce</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv413g_doSimExtend"><code class="docutils literal notranslate"><span class="pre">g_doSimExtend</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv414g_doSimRestart"><code class="docutils literal notranslate"><span class="pre">g_doSimRestart</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv423g_doSimRestartCheckOnly"><code class="docutils literal notranslate"><span class="pre">g_doSimRestartCheckOnly</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv47g_E_buf"><code class="docutils literal notranslate"><span class="pre">g_E_buf</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv413g_E_init_vals"><code class="docutils literal notranslate"><span class="pre">g_E_init_vals</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv416g_enable_logging"><code class="docutils literal notranslate"><span class="pre">g_enable_logging</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv424g_enable_sidm_scattering"><code class="docutils literal notranslate"><span class="pre">g_enable_sidm_scattering</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv413g_energy_file"><code class="docutils literal notranslate"><span class="pre">g_energy_file</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv425g_energy_snapshots_loaded"><code class="docutils literal notranslate"><span class="pre">g_energy_snapshots_loaded</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv420g_extend_file_source"><code class="docutils literal notranslate"><span class="pre">g_extend_file_source</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv422g_falloff_factor_param"><code class="docutils literal notranslate"><span class="pre">g_falloff_factor_param</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv431g_falloff_factor_param_provided"><code class="docutils literal notranslate"><span class="pre">g_falloff_factor_param_provided</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv413g_file_suffix"><code class="docutils literal notranslate"><span class="pre">g_file_suffix</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv417g_halo_mass_param"><code class="docutils literal notranslate"><span class="pre">g_halo_mass_param</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv426g_halo_mass_param_provided"><code class="docutils literal notranslate"><span class="pre">g_halo_mass_param_provided</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv416g_hybrid_p_cores"><code class="docutils literal notranslate"><span class="pre">g_hybrid_p_cores</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv419g_initial_cond_seed"><code class="docutils literal notranslate"><span class="pre">g_initial_cond_seed</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv433g_initial_cond_seed_filename_base"><code class="docutils literal notranslate"><span class="pre">g_initial_cond_seed_filename_base</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv428g_initial_cond_seed_provided"><code class="docutils literal notranslate"><span class="pre">g_initial_cond_seed_provided</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv416g_insertion_wins"><code class="docutils literal notranslate"><span class="pre">g_insertion_wins</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv47g_L_buf"><code class="docutils literal notranslate"><span class="pre">g_L_buf</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv413g_L_init_vals"><code class="docutils literal notranslate"><span class="pre">g_L_init_vals</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv416g_l_target_value"><code class="docutils literal notranslate"><span class="pre">g_l_target_value</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv415g_lowestL_E_buf"><code class="docutils literal notranslate"><span class="pre">g_lowestL_E_buf</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv414g_lowestL_file"><code class="docutils literal notranslate"><span class="pre">g_lowestL_file</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv415g_lowestL_L_buf"><code class="docutils literal notranslate"><span class="pre">g_lowestL_L_buf</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv415g_lowestL_r_buf"><code class="docutils literal notranslate"><span class="pre">g_lowestL_r_buf</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv413g_master_seed"><code class="docutils literal notranslate"><span class="pre">g_master_seed</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv422g_master_seed_provided"><code class="docutils literal notranslate"><span class="pre">g_master_seed_provided</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv48g_mu_buf"><code class="docutils literal notranslate"><span class="pre">g_mu_buf</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv428g_nfw_profile_falloff_factor"><code class="docutils literal notranslate"><span class="pre">g_nfw_profile_falloff_factor</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv423g_nfw_profile_halo_mass"><code class="docutils literal notranslate"><span class="pre">g_nfw_profile_halo_mass</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv416g_nfw_profile_rc"><code class="docutils literal notranslate"><span class="pre">g_nfw_profile_rc</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv430g_nfw_profile_rmax_norm_factor"><code class="docutils literal notranslate"><span class="pre">g_nfw_profile_rmax_norm_factor</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv426g_om_aniso_factor_provided"><code class="docutils literal notranslate"><span class="pre">g_om_aniso_factor_provided</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv422g_om_anisotropy_radius"><code class="docutils literal notranslate"><span class="pre">g_om_anisotropy_radius</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv420g_om_ra_scale_factor"><code class="docutils literal notranslate"><span class="pre">g_om_ra_scale_factor</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv424g_particle_scatter_state"><code class="docutils literal notranslate"><span class="pre">g_particle_scatter_state</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv421g_precalc_force_const"><code class="docutils literal notranslate"><span class="pre">g_precalc_force_const</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv418g_profile_type_str"><code class="docutils literal notranslate"><span class="pre">g_profile_type_str</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv427g_profile_type_str_provided"><code class="docutils literal notranslate"><span class="pre">g_profile_type_str_provided</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv415g_quadsort_wins"><code class="docutils literal notranslate"><span class="pre">g_quadsort_wins</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv412g_radix_wins"><code class="docutils literal notranslate"><span class="pre">g_radix_wins</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv423g_restart_file_override"><code class="docutils literal notranslate"><span class="pre">g_restart_file_override</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv426g_restart_initial_timestep"><code class="docutils literal notranslate"><span class="pre">g_restart_initial_timestep</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv421g_restart_mode_active"><code class="docutils literal notranslate"><span class="pre">g_restart_mode_active</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv428g_restart_snapshots_is_count"><code class="docutils literal notranslate"><span class="pre">g_restart_snapshots_is_count</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv45g_rng"><code class="docutils literal notranslate"><span class="pre">g_rng</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv420g_scale_radius_param"><code class="docutils literal notranslate"><span class="pre">g_scale_radius_param</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv429g_scale_radius_param_provided"><code class="docutils literal notranslate"><span class="pre">g_scale_radius_param_provided</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv421g_sidm_execution_mode"><code class="docutils literal notranslate"><span class="pre">g_sidm_execution_mode</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv412g_sidm_kappa"><code class="docutils literal notranslate"><span class="pre">g_sidm_kappa</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv421g_sidm_kappa_provided"><code class="docutils literal notranslate"><span class="pre">g_sidm_kappa_provided</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv428g_sidm_max_interaction_range"><code class="docutils literal notranslate"><span class="pre">g_sidm_max_interaction_range</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv411g_sidm_seed"><code class="docutils literal notranslate"><span class="pre">g_sidm_seed</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv425g_sidm_seed_filename_base"><code class="docutils literal notranslate"><span class="pre">g_sidm_seed_filename_base</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv420g_sidm_seed_provided"><code class="docutils literal notranslate"><span class="pre">g_sidm_seed_provided</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv418g_single_traj_file"><code class="docutils literal notranslate"><span class="pre">g_single_traj_file</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv417g_sort_call_count"><code class="docutils literal notranslate"><span class="pre">g_sort_call_count</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv421g_sort_columns_buffer"><code class="docutils literal notranslate"><span class="pre">g_sort_columns_buffer</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv426g_sort_columns_buffer_npts"><code class="docutils literal notranslate"><span class="pre">g_sort_columns_buffer_npts</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv410g_time_buf"><code class="docutils literal notranslate"><span class="pre">g_time_buf</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv416g_time_snapshots"><code class="docutils literal notranslate"><span class="pre">g_time_snapshots</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv49g_total_E"><code class="docutils literal notranslate"><span class="pre">g_total_E</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv422g_total_insertion_time"><code class="docutils literal notranslate"><span class="pre">g_total_insertion_time</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv410g_total_KE"><code class="docutils literal notranslate"><span class="pre">g_total_KE</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv410g_total_PE"><code class="docutils literal notranslate"><span class="pre">g_total_PE</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv421g_total_quadsort_time"><code class="docutils literal notranslate"><span class="pre">g_total_quadsort_time</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv418g_total_radix_time"><code class="docutils literal notranslate"><span class="pre">g_total_radix_time</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv421g_total_sidm_scatters"><code class="docutils literal notranslate"><span class="pre">g_total_sidm_scatters</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv411g_traj_file"><code class="docutils literal notranslate"><span class="pre">g_traj_file</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv418g_trajectories_buf"><code class="docutils literal notranslate"><span class="pre">g_trajectories_buf</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv425g_trajectory_buffer_index"><code class="docutils literal notranslate"><span class="pre">g_trajectory_buffer_index</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv424g_trajectory_buffer_size"><code class="docutils literal notranslate"><span class="pre">g_trajectory_buffer_size</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv425g_use_graph_coloring_sidm"><code class="docutils literal notranslate"><span class="pre">g_use_graph_coloring_sidm</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv429g_use_hernquist_aniso_profile"><code class="docutils literal notranslate"><span class="pre">g_use_hernquist_aniso_profile</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv425g_use_hernquist_numerical"><code class="docutils literal notranslate"><span class="pre">g_use_hernquist_numerical</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv417g_use_nfw_profile"><code class="docutils literal notranslate"><span class="pre">g_use_nfw_profile</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv425g_use_numerical_isotropic"><code class="docutils literal notranslate"><span class="pre">g_use_numerical_isotropic</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv416g_use_om_profile"><code class="docutils literal notranslate"><span class="pre">g_use_om_profile</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv416g_velocities_buf"><code class="docutils literal notranslate"><span class="pre">g_velocities_buf</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv48ID_block"><code class="docutils literal notranslate"><span class="pre">ID_block</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv47L_block"><code class="docutils literal notranslate"><span class="pre">L_block</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv48Lcompare"><code class="docutils literal notranslate"><span class="pre">Lcompare</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv47nlowest"><code class="docutils literal notranslate"><span class="pre">nlowest</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv413normalization"><code class="docutils literal notranslate"><span class="pre">normalization</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv418num_traj_particles"><code class="docutils literal notranslate"><span class="pre">num_traj_particles</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv430PARALLEL_SORT_DEFAULT_SECTIONS"><code class="docutils literal notranslate"><span class="pre">PARALLEL_SORT_DEFAULT_SECTIONS</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv438PARALLEL_SORT_MIN_CHUNK_SIZE_THRESHOLD"><code class="docutils literal notranslate"><span class="pre">PARALLEL_SORT_MIN_CHUNK_SIZE_THRESHOLD</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv437PARALLEL_SORT_MIN_CORRECTNESS_OVERLAP"><code class="docutils literal notranslate"><span class="pre">PARALLEL_SORT_MIN_CORRECTNESS_OVERLAP</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv429PARALLEL_SORT_OVERLAP_DIVISOR"><code class="docutils literal notranslate"><span class="pre">PARALLEL_SORT_OVERLAP_DIVISOR</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv433PARALLEL_SORT_SECTIONS_PER_THREAD"><code class="docutils literal notranslate"><span class="pre">PARALLEL_SORT_SECTIONS_PER_THREAD</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv49phi_block"><code class="docutils literal notranslate"><span class="pre">phi_block</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv47R_block"><code class="docutils literal notranslate"><span class="pre">R_block</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv410Rank_block"><code class="docutils literal notranslate"><span class="pre">Rank_block</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv416readInitFilename"><code class="docutils literal notranslate"><span class="pre">readInitFilename</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv419scatter_count_block"><code class="docutils literal notranslate"><span class="pre">scatter_count_block</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv416skip_file_writes"><code class="docutils literal notranslate"><span class="pre">skip_file_writes</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv423use_closest_to_Lcompare"><code class="docutils literal notranslate"><span class="pre">use_closest_to_Lcompare</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv420use_identity_gravity"><code class="docutils literal notranslate"><span class="pre">use_identity_gravity</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv410Vrad_block"><code class="docutils literal notranslate"><span class="pre">Vrad_block</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv417writeInitFilename"><code class="docutils literal notranslate"><span class="pre">writeInitFilename</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv422cored_potential_params"><code class="docutils literal notranslate"><span class="pre">cored_potential_params</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv431fE_integrand_params_hernquist_t"><code class="docutils literal notranslate"><span class="pre">fE_integrand_params_hernquist_t</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv425fE_integrand_params_NFW_t"><code class="docutils literal notranslate"><span class="pre">fE_integrand_params_NFW_t</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv418fEintegrand_params"><code class="docutils literal notranslate"><span class="pre">fEintegrand_params</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv416hernquist_params"><code class="docutils literal notranslate"><span class="pre">hernquist_params</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv426hernquist_potential_params"><code class="docutils literal notranslate"><span class="pre">hernquist_potential_params</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv49LAndIndex"><code class="docutils literal notranslate"><span class="pre">LAndIndex</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv420nfw_potential_params"><code class="docutils literal notranslate"><span class="pre">nfw_potential_params</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv421om_mu_integral_params"><code class="docutils literal notranslate"><span class="pre">om_mu_integral_params</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv48PartData"><code class="docutils literal notranslate"><span class="pre">PartData</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv419Psiintegrand_params"><code class="docutils literal notranslate"><span class="pre">Psiintegrand_params</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv49RrPsiPair"><code class="docutils literal notranslate"><span class="pre">RrPsiPair</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_core.html#_CPPv411threevector"><code class="docutils literal notranslate"><span class="pre">threevector</span></code></a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="nsphere_sort.html">NSphere Sort (nsphere_sort.h)</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_sort.html#c.ns_sort_array"><code class="docutils literal notranslate"><span class="pre">ns_sort_array</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_sort.html#c.ns_sort_extended"><code class="docutils literal notranslate"><span class="pre">ns_sort_extended</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_sort.html#c.ns_sort_prim"><code class="docutils literal notranslate"><span class="pre">ns_sort_prim</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_sort.html#c.ns_sort_size"><code class="docutils literal notranslate"><span class="pre">ns_sort_size</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="nsphere_sort.html#_CPPv420ns_quadsort_extendedPv6size_t6size_tP7CMPFUNC"><code class="docutils literal notranslate"><span class="pre">ns_quadsort_extended()</span></code></a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="quadsort.html">QuadSort (<cite>quadsort.c</cite> / <cite>quadsort.h</cite>)</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="quadsort.html#c.branchless_swap"><code class="docutils literal notranslate"><span class="pre">branchless_swap</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="quadsort.html#c.cmp"><code class="docutils literal notranslate"><span class="pre">cmp</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="quadsort.html#c.FUNC"><code class="docutils literal notranslate"><span class="pre">FUNC</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="quadsort.html#c.head_branchless_merge"><code class="docutils literal notranslate"><span class="pre">head_branchless_merge</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="quadsort.html#c.parity_merge_four"><code class="docutils literal notranslate"><span class="pre">parity_merge_four</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="quadsort.html#c.parity_merge_two"><code class="docutils literal notranslate"><span class="pre">parity_merge_two</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="quadsort.html#c.QUAD_CACHE"><code class="docutils literal notranslate"><span class="pre">QUAD_CACHE</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="quadsort.html#c.swap_branchless"><code class="docutils literal notranslate"><span class="pre">swap_branchless</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="quadsort.html#c.tail_branchless_merge"><code class="docutils literal notranslate"><span class="pre">tail_branchless_merge</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="quadsort.html#c.VAR"><code class="docutils literal notranslate"><span class="pre">VAR</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="quadsort.html#_CPPv47CMPFUNC"><code class="docutils literal notranslate"><span class="pre">CMPFUNC</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="quadsort.html#_CPPv48quadsortPv6size_t6size_tP7CMPFUNC"><code class="docutils literal notranslate"><span class="pre">quadsort()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="quadsort.html#_CPPv413quadsort_primPv6size_t6size_t"><code class="docutils literal notranslate"><span class="pre">quadsort_prim()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="quadsort.html#_CPPv413quadsort_sizePv6size_t6size_tP7CMPFUNC"><code class="docutils literal notranslate"><span class="pre">quadsort_size()</span></code></a></li>
+</ul>
+</li>
+</ul>
+</div>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="../data_flow/index.html" class="btn btn-neutral float-left" title="Data and Results Flow" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="nsphere_core.html" class="btn btn-neutral float-right" title="NSphere Core (nsphere.c)" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2025, Kris Sigurdson.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

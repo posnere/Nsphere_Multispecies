@@ -1,0 +1,367 @@
+#!/bin/bash
+#
+# activate_nsphere - Helper to create/check, install dependencies,
+#                    and ACTIVATE the NSphere Python virtual environment.
+#
+# Usage:
+#   Run this script using the 'source' command from the project root:
+#   source ./activate_nsphere
+#   (or using '.' -> . ./activate_nsphere)
+#
+# This script will:
+# 1. Check if the './venv/nsphere' directory exists AND is a virtual environment.
+# 2. If it doesn't exist or isn't a venv:
+#    a. Create it using 'python3 -m venv venv/nsphere'.
+#    b. Install/upgrade pip within the new venv.
+#    c. Install dependencies from 'requirements.txt' into the new venv.
+# 3. If the venv exists or was just created, it attempts to ACTIVATE it
+#    for the CURRENT shell session using the 'source' command.
+#
+# IMPORTANT: This script relies on being run with 'source' or '.'
+#            for the activation part to affect your current shell.
+#            Running it directly ('./activate_nsphere') will only
+#            create/install, not activate your interactive session.
+#
+
+# --- OS and Environment Detection ---
+# Detect the operating system and environment
+OS_NAME=$(uname -s)
+IS_MSYS=0
+
+# Check for MSYS2/CLANG64 environment on Windows
+if [[ "$OS_NAME" == MSYS* || "$OS_NAME" == MINGW* || "$OS_NAME" == CLANG* ]]; then
+    IS_MSYS=1
+    # Report OS detection details for debugging
+    echo "Detected Windows-like environment: OS_NAME=$OS_NAME, MSYSTEM=$MSYSTEM"
+    
+    if [[ "$MSYSTEM" == "CLANG64" || "$MSYSTEM" == *"CLANG"* || "$OS_NAME" == *"CLANG"* ]]; then
+        echo "Confirmed CLANG-based environment (MSYSTEM=$MSYSTEM)"
+        echo "Will use --system-site-packages to access pacman-installed Python packages."
+    else
+        echo "WARNING: Windows MSYS2 environment detected, but not CLANG64."
+        echo "For best results, please run this script from the CLANG64 shell."
+        echo "Current environment: MSYSTEM=$MSYSTEM, OS_NAME=$OS_NAME"
+        echo "If you believe this is an error and you are already in CLANG64,"
+        echo "you can edit the activate_nsphere script to bypass this check."
+    fi
+else
+    # Regular Linux, macOS, or Windows without MSYS2
+    echo "Detected standard environment: $OS_NAME"
+fi
+
+# --- Configuration ---
+VENV_DIR_NAME="venv"
+VENV_NAME="nsphere"
+
+# Set Python command based on environment
+if [ $IS_MSYS -eq 1 ]; then
+    PYTHON_CMD="python" # MSYS2/CLANG64 uses 'python' not 'python3'
+    # Verify Python is installed in the CLANG64 environment
+    if ! command -v python &> /dev/null; then
+        echo "ERROR: 'python' command not found in MSYS2/CLANG64 environment." >&2
+        echo "Please ensure the mingw-w64-clang-x86_64-python package is installed." >&2
+        echo "Use: pacman -S mingw-w64-clang-x86_64-python" >&2
+        return 1 # Return error code
+    fi
+else
+    PYTHON_CMD="python3" # Standard for Unix/Linux/macOS
+fi
+
+REQUIREMENTS_FILE="requirements.txt"
+# --- End Configuration ---
+
+# Get the project root (directory containing this script)
+# Use BASH_SOURCE if available, fallback to $0 for wider compatibility (though sourced scripts often have $0 as bash)
+# Corrected to handle sourced vs direct execution better
+if [ -n "$BASH_SOURCE" ]; then
+    _SCRIPT_PATH="${BASH_SOURCE[0]}"
+else
+    _SCRIPT_PATH="$0"
+fi
+PROJECT_ROOT="$( cd "$( dirname "$_SCRIPT_PATH" )" &> /dev/null && pwd )"
+
+
+VENV_BASE_PATH="$PROJECT_ROOT/$VENV_DIR_NAME"
+VENV_PATH="$VENV_BASE_PATH/$VENV_NAME"
+REQS_PATH="$PROJECT_ROOT/$REQUIREMENTS_FILE"
+ACTIVATION_SCRIPT="$VENV_PATH/bin/activate" # Standard activation script path
+
+echo "--- NSphere Python Environment Activation ---"
+echo "Project Root: $PROJECT_ROOT"
+echo "Target Venv:  $VENV_PATH"
+echo
+
+# --- Helper Function to check if a directory looks like a venv ---
+is_venv_dir() {
+    local dir_path="$1"
+    if [ -d "$dir_path" ] && \
+       [ -f "$dir_path/pyvenv.cfg" ] && \
+       [ -d "$dir_path/bin" ] && \
+       [ -f "$dir_path/bin/activate" ]; then
+        return 0 # True
+    else
+        return 1 # False
+    fi
+}
+
+# --- Main Logic ---
+
+# Check prerequisites first
+if ! command -v $PYTHON_CMD &> /dev/null; then
+    echo "ERROR: '$PYTHON_CMD' command not found. Python 3.8+ required." >&2
+    return 1 # Return error code
+fi
+if [ ! -f "$REQS_PATH" ]; then
+    echo "ERROR: Requirements file '$REQS_PATH' not found." >&2
+    return 1
+fi
+
+# Check if the target path exists and is NOT a valid venv
+if [ -e "$VENV_PATH" ] && ! is_venv_dir "$VENV_PATH"; then
+    echo "ERROR: Path '$VENV_PATH' exists but is not a valid Python virtual environment." >&2
+    echo "       Please remove or rename it and run this script again." >&2
+    return 1
+fi
+
+# Create venv and install dependencies IF it doesn't exist
+if ! is_venv_dir "$VENV_PATH"; then
+    # Ensure base venv directory exists
+    if [ ! -d "$VENV_BASE_PATH" ]; then
+         mkdir -p "$VENV_BASE_PATH"
+         if [ $? -ne 0 ]; then
+             echo "ERROR: Failed to create base directory '$VENV_BASE_PATH'." >&2
+             return 1
+         fi
+    fi
+
+    echo "Virtual environment '$VENV_PATH' not found. Creating..."
+    # Use --system-site-packages only for MSYS2/CLANG64 to access pacman packages
+    if [ $IS_MSYS -eq 1 ]; then
+        echo "Using --system-site-packages to access system Python packages (recommended for MSYS2)"
+        "$PYTHON_CMD" -m venv "$VENV_PATH" --upgrade-deps --system-site-packages
+    else
+        # Standard venv creation for Linux/macOS/regular Windows
+        "$PYTHON_CMD" -m venv "$VENV_PATH" --upgrade-deps
+    fi
+    
+    if [ $? -ne 0 ]; then
+        echo "ERROR: Failed to create virtual environment at '$VENV_PATH'." >&2
+        return 1
+    fi
+    echo "Virtual environment created successfully."
+    echo
+
+    echo "Installing dependencies from '$REQUIREMENTS_FILE'..."
+    # Explicitly use the python interpreter inside the venv to run pip
+    "$VENV_PATH/bin/python" -m pip install -r "$REQS_PATH"
+    if [ $? -ne 0 ]; then
+        echo "ERROR: Failed to install dependencies into '$VENV_NAME'." >&2
+        echo "Activate manually ('source $VENV_DIR_NAME/$VENV_NAME/bin/activate') and run 'pip install -r $REQUIREMENTS_FILE' again." >&2
+        return 1
+    fi
+    echo "Dependencies installed successfully."
+    echo "------------------------------------------------------------------"
+    echo "SETUP COMPLETE. Activating environment for this session..."
+    echo "------------------------------------------------------------------"
+    # Fall through to activation block below
+else
+    # Venv exists - verify that required packages were installed successfully
+    echo "Virtual environment '$VENV_PATH' already exists."
+    
+    # Function to check if a package is installed in the virtual environment
+    check_package() {
+        local pkg="$1"
+        # Attempt to import the package using the venv's Python
+        "$VENV_PATH/bin/python" -c "import $pkg" 2>/dev/null
+        return $?
+    }
+    
+    # Read all packages from requirements.txt and check each one
+    echo "Verifying required packages..."
+    MISSING_PACKAGES=()
+    
+    # Parse requirements.txt to get package names (strip version numbers)
+    if [ -f "$REQS_PATH" ]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            # Skip empty lines and comments
+            if [[ -z "$line" || "$line" =~ ^# ]]; then
+                continue
+            fi
+            
+            # Extract package name before any version specifier
+            pkg=$(echo "$line" | sed -E 's/([a-zA-Z0-9_\.-]+)(.*)/\1/')
+            
+            # Some packages have different import names
+            case "$pkg" in
+                "imageio") import_name="imageio" ;;
+                "matplotlib") import_name="matplotlib" ;;
+                "numpy") import_name="numpy" ;;
+                "psutil") import_name="psutil" ;;
+                "scipy") import_name="scipy" ;;
+                "tqdm") import_name="tqdm" ;;
+                "jupyter") import_name="jupyter" ;;
+                *) import_name="$pkg" ;;
+            esac
+            
+            # Check if package is installed
+            echo -n "  Checking $pkg... "
+            if check_package "$import_name"; then
+                echo "OK"
+            else
+                echo "MISSING"
+                MISSING_PACKAGES+=("$pkg")
+            fi
+        done < "$REQS_PATH"
+    else
+        echo "WARNING: Cannot verify packages - requirements file not found at: $REQS_PATH" >&2
+    fi
+    
+    # Handle missing packages if any
+    if [ ${#MISSING_PACKAGES[@]} -gt 0 ]; then
+        echo ""
+        echo "WARNING: The following required packages are missing:"
+        printf "  - %s\n" "${MISSING_PACKAGES[@]}"
+        echo ""
+        echo "This indicates that the previous dependency installation was incomplete."
+        echo -n "Would you like to reinstall all dependencies from '$REQUIREMENTS_FILE'? [y/N] "
+        read -r answer
+        if [[ "$answer" =~ ^[Yy] ]]; then
+            echo ""
+            echo "Installing dependencies from '$REQUIREMENTS_FILE'..."
+            "$VENV_PATH/bin/python" -m pip install -r "$REQS_PATH"
+            if [ $? -ne 0 ]; then
+                echo "ERROR: Failed to install dependencies into '$VENV_NAME'." >&2
+                echo "You may need to manually fix the issues or recreate the environment." >&2
+                echo "Try removing the virtual environment with 'rm -rf $VENV_PATH' and run this script again."
+                # Continue with activation despite errors
+            else
+                echo "Dependencies installed successfully."
+                # Verify the installation worked
+                STILL_MISSING=()
+                echo "Verifying installation..."
+                for pkg in "${MISSING_PACKAGES[@]}"; do
+                    case "$pkg" in
+                        "imageio") import_name="imageio" ;;
+                        "matplotlib") import_name="matplotlib" ;;
+                        "numpy") import_name="numpy" ;;
+                        "psutil") import_name="psutil" ;;
+                        "scipy") import_name="scipy" ;;
+                        "tqdm") import_name="tqdm" ;;
+                        "jupyter") import_name="jupyter" ;;
+                        *) import_name="$pkg" ;;
+                    esac
+                    
+                    if ! check_package "$import_name"; then
+                        STILL_MISSING+=("$pkg")
+                    fi
+                done
+                
+                if [ ${#STILL_MISSING[@]} -gt 0 ]; then
+                    echo "WARNING: Some packages are still missing after installation:"
+                    printf "  - %s\n" "${STILL_MISSING[@]}"
+                    echo "You may need to install these packages manually or recreate the environment."
+                else
+                    echo "All packages verified successfully!"
+                fi
+            fi
+        else
+            echo "Continuing without reinstalling dependencies. Some features may not work correctly."
+        fi
+    else
+        echo "All required packages are installed correctly."
+    fi
+
+fi
+
+# --- Activation Attempt ---
+# This part only works correctly if the script is *sourced*
+if [ -f "$ACTIVATION_SCRIPT" ]; then
+    # Use 'source' command explicitly within the script.
+    # This relies on the script itself being sourced by the user.
+    # Also check if already active to prevent recursive sourcing errors
+    if [ -z "$VIRTUAL_ENV" ] || [ "$VIRTUAL_ENV" != "$VENV_PATH" ]; then
+         source "$ACTIVATION_SCRIPT"
+         if [ $? -eq 0 ]; then
+             echo "Activating environment for this session..."
+
+             # Trust example notebooks if not already trusted
+             notebooks_to_sign=()
+             for notebook in examples/nsphere_notebook_example*.ipynb; do
+                 [ -f "$notebook" ] || continue
+
+                 # Check if already trusted
+                 is_trusted=$(python3 -c "
+from nbformat.sign import NotebookNotary
+import nbformat
+import warnings
+warnings.filterwarnings('ignore')
+try:
+    with open('$notebook', 'r') as f:
+        nb = nbformat.read(f, as_version=4)
+    notary = NotebookNotary()
+    print('yes' if notary.check_signature(nb) else 'no')
+except:
+    print('no')
+" 2>/dev/null)
+
+                 if [ "$is_trusted" != "yes" ]; then
+                     notebooks_to_sign+=("$notebook")
+                 fi
+             done
+
+             # Sign notebooks if needed and show summary
+             if [ ${#notebooks_to_sign[@]} -gt 0 ]; then
+                 if [ ${#notebooks_to_sign[@]} -eq 1 ]; then
+                     echo "Signing 1 example notebook."
+                 else
+                     echo "Signing ${#notebooks_to_sign[@]} example notebooks."
+                 fi
+                 for notebook in "${notebooks_to_sign[@]}"; do
+                     jupyter trust "$notebook" &>/dev/null
+                 done
+             fi
+
+             echo "------------------------------------------------------------------"
+             echo "Environment '$VENV_NAME' activated."
+
+             echo "Your prompt should now show '($VENV_NAME)'."
+             echo "-------------------------------------------------------------------"
+             echo "If '($VENV_NAME)' is not in your prompt, you didn't run with source."
+             echo "Run either 'source ./activate_nsphere' or '. ./activate_nsphere'."
+             echo "-------------------------------------------------------------------"
+             # Check environment configuration
+             if [ $IS_MSYS -eq 1 ]; then
+                 # For MSYS2, verify system packages are accessible
+                 if grep -q "include-system-site-packages = true" "$VENV_PATH/pyvenv.cfg" 2>/dev/null; then
+                     echo "System site packages are accessible (important for MSYS2/CLANG64)."
+                 else
+                     echo "WARNING: System site packages do not appear to be accessible."
+                     echo "This may cause issues with matplotlib, scipy, etc. in MSYS2."
+                     echo "Consider removing '$VENV_PATH' and running this script again."
+                 fi
+             fi
+
+             # Optional: Check if pip is available after activation
+             if ! command -v pip &> /dev/null; then
+                 echo "WARNING: 'pip' command not found after activation. Dependency management might be affected." >&2
+             fi
+
+             echo "You can now run NSphere executables like './nsphere_plot'."
+         else
+             echo "ERROR: Failed to source activation script '$ACTIVATION_SCRIPT'." >&2
+             echo "Please activate manually: source $VENV_DIR_NAME/$VENV_NAME/bin/activate" >&2
+             return 1
+         fi
+    else
+        echo "Environment '$VENV_NAME' is already active."
+    fi
+else
+    echo "ERROR: Activation script '$ACTIVATION_SCRIPT' not found." >&2
+    echo "The virtual environment might be corrupted." >&2
+    return 1
+fi
+
+echo "------------------------------------------------------------------"
+
+# Use return for sourced scripts, exit for direct execution (though direct execution isn't the main use case)
+return 0 || exit 0
