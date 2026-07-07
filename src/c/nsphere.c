@@ -775,6 +775,9 @@ static inline double get_deterministic_rand(uint64_t seed, int step, int id, int
 
 static double g_active_halo_mass = HALO_MASS; ///< Active halo mass for N-body force calculations.
 
+// Constants for use in numerical estimations
+# define RANK_BUFFER 5 ///< Number of ranks on either side of target particle used to estimate local density and velocity dispersion.
+
 /**
  * @brief Angular momentum selection configuration for particle filtering.
  * @details Mode 0: Select particles with the 5 lowest \f$L\f$ values.
@@ -895,6 +898,10 @@ static int nlowest = 5;           ///< Number of lowest angular momentum particl
 static int num_traj_particles = 10; ///< Number of particles to track in trajectories.dat (by original ID).
 static int *chosen = NULL;        ///< Array of indices (original IDs) for selected low-L particles.
 
+// State arrays for thread stability. Used in dynamic friction calculation.
+static double *rho_snapshot = NULL;
+static double *v_sq_snapshot = NULL;
+
 /**
  * @brief Frees all global arrays used for particle data processing.
  * @details Frees L_block, Rank_block, R_block, Vrad_block, and chosen.
@@ -924,6 +931,13 @@ void cleanup_all_particle_data(void)
 
     // Free low angular momentum tracking arrays
     free(chosen);
+
+    // Free mass prefix array
+    free(g_mass_prefix_sum);
+
+    // Free snapshots for dynamical drag calculation
+    free(rho_snapshot);
+    free(v_sq_snapshot);
 
 }
 
@@ -1256,13 +1270,6 @@ static void allocate_trajectory_buffers(int num_traj_particles, int nlowest, int
         fprintf(stderr, "ERROR: Failed to allocate initial value arrays\n");
         CLEAN_EXIT(1);
     }
-
-    // Allocate prefix sum of masses
-    g_mass_prefix_sum = (double*)calloc(npts, sizeof(double));
-    if (!g_mass_prefix_sum) {
-        fprintf(stderr, "ERROR: Failed to allocate prefix sum of masses\n");
-        CLEAN_EXIT(1);
-    }
 }
 
 /**
@@ -1410,9 +1417,6 @@ static void cleanup_trajectory_buffers(int num_traj_particles, int nlowest) {
     free(g_E_init_vals);
     free(g_L_init_vals);
 
-    // Free prefix sum of masses
-    free(g_mass_prefix_sum);
-    g_mass_prefix_sum = NULL;
 }
 
 /**
@@ -1719,6 +1723,112 @@ static inline double gravitational_force(double r, int current_rank, int npts, d
 static inline double effective_angular_force(double r, double ell)
 {
     return (ell * ell) / (r * r * r);
+}
+
+/**
+ * @brief Computes the local density around a certain point.
+ *
+ * @param particles           [in] Particle data array (rows: position...).
+ * @param current_rank        [in] Particle rank (0 to npts-1), used to index `particles`.
+ * @param g_mass_prefix_sum   [in] Prefix sum of particle masses.
+ * @param npts                [in] Total number of particles.
+ */
+static inline double calculate_rho(double** particles, int current_rank, double* g_mass_prefix_sum, int npts)
+{
+    if (current_rank >= npts - RANK_BUFFER || current_rank < RANK_BUFFER) {
+        return 0.0;
+    }
+    double delta_M = g_mass_prefix_sum[current_rank + RANK_BUFFER] - g_mass_prefix_sum[current_rank - RANK_BUFFER];
+    double r_max = particles[0][current_rank + RANK_BUFFER];
+    double r_min = particles[0][current_rank - RANK_BUFFER];
+
+    return delta_M / ((4 * PI / 3) * (r_max * r_max * r_max - r_min * r_min * r_min));
+}
+
+/**
+* @brief Computes the dynamical friction (Chandrasekhar drag) a particle feels due to
+ *        the local density of surrounding particles.
+ *
+ * @details Estimates the local mass density and velocity dispersion from the
+ *          `2*RANK_BUFFER+1` particles immediately bracketing `current_rank` in radius
+ *          (particles are assumed rank-sorted by radius), then applies the standard
+ *          Chandrasekhar dynamical friction formula to getthe deceleration magnitude.
+ *          Returns zero for the innermost/outermost `RANK_BUFFER` particles,
+ *          where there are not enough neighbors on both sides
+ *          to form a local density/dispersion estimate.
+ *
+ * @param r              [in] Radial position (kpc).
+ * @param v_rad          [in] Radial velocity (kpc/Myr).
+ * @param current_rank   [in] Particle rank (0 to npts-1), used to index `particles`
+ *                          and `g_mass_prefix_sum` and to locate the local neighbor shell.
+ * @param ell            [in] Angular momentum per unit mass (kpc\f$^2\f$/Myr).
+ * @param particles      [in] Particle data array (rows: position, radial velocity,
+ *                          angular momentum, ..., mass).
+ * @param rho_snapshot   [in] snapshot of local density.
+ * @param v_sq_snapshot  [in] Snapshot of squared velocities of all particles.
+ * @param npts           [in] Total number of particles.
+ * @param G_value        [in] Gravitational constant value (e.g., G_CONST).
+ * @param dvdt_drag      [out] Drag contribution to \f$dv_{rad}/dt\f$ (kpc/Myr\f$^2\f$).
+ * @param delldt_drag    [out] Drag contribution to \f$d\ell/dt\f$ (kpc\f$^2\f$/Myr\f$^2\f$),
+ *                          i.e. the rate of angular momentum loss from the tangential
+ *                          component of drag.
+ */
+
+
+static inline void drag_force(double r, double v_rad, 
+                              int current_rank, 
+                              double ell, 
+                              double** particles,
+                              double* rho_snapshot, double* v_sq_snapshot,
+                              int npts, double G_value, 
+                              double *dvdt_drag, double *delldt_drag)
+{
+    if (current_rank >= npts - RANK_BUFFER || current_rank < RANK_BUFFER)
+    {
+        *dvdt_drag = 0.0;
+        *delldt_drag = 0.0;
+        return;
+    }
+    if (!isfinite(r) || r <= 0.0)
+    {
+        *dvdt_drag = 0.0;
+        *delldt_drag = 0.0;
+        return;
+    }
+
+    double rho_enc = rho_snapshot[current_rank];
+    double X_vel = 0.0;
+    double X_squared_mean = 0.0;
+    for (int i = -1 * RANK_BUFFER; i <= RANK_BUFFER; i++)
+    {
+        X_squared_mean += v_sq_snapshot[current_rank + i];
+    }
+
+    X_squared_mean = X_squared_mean / (2.0 * RANK_BUFFER + 1);
+    if (X_squared_mean <= 1e-30) {
+        *dvdt_drag = 0.0;
+        *delldt_drag = 0.0;
+        return;
+    }
+
+    double v = sqrt(v_rad * v_rad + ell * ell / (r * r));
+    if (v < 1e-15) {
+        *dvdt_drag = 0.0;
+        *delldt_drag = 0.0;
+        return;
+    }
+
+    X_vel = v/(sqrt(2*X_squared_mean / 3));
+
+    double ln_lambda = 12.9; // Set manually temporarily. approx ln(0.4*npts) for npts = 10^6.
+      
+    double v_inv = 1 / v;
+    double dispersive_conponent = erf(X_vel) - (2 / sqrt(PI)) * X_vel * exp(-1 * X_vel * X_vel);
+    double drag_total = 4 * PI * G_value * G_value * particles[8][current_rank] * rho_enc * ln_lambda * v_inv * v_inv * dispersive_conponent; // See eq 8.3 in Binney & Tremaine
+    
+    *dvdt_drag = -drag_total * v_rad * v_inv; // dv/dt due to the dynamic drag.
+    *delldt_drag = -drag_total * ell * v_inv; // dell/dt due to the dynamic drag.
+    
 }
 
 /**
@@ -3443,26 +3553,33 @@ int cmp_LAI(const void *a, const void *b)
  * @param npts                [in] Total number of particles.
  * @param r_in                [in] Input radial position (kpc) at the start of the total interval `h`.
  * @param v_in                [in] Input radial velocity (kpc/Myr) at the start of `h`.
- * @param ell                 [in] Angular momentum per unit mass (kpc\f$^2\f$/Myr).
+ * @param ell_in              [in] Angular momentum per unit mass (kpc\f$^2\f$/Myr).
  * @param h                   [in] Total physical time interval for this leapfrog sequence (Myr).
  * @param N_subdivision_factor [in] Base subdivision factor \f$N\f$ used to determine micro-timestep sizes.
  * @param subSteps            [in] Total number of Kicks/Drifts (e.g., \f$2N+1\f$ or \f$4N+1\f$).
  * @param grav                [in] Gravitational constant G (simulation units).
+ * @param particles           [in] Particle data array.
+ * @param rho_snapshot        [in] snapshot of local density.
+ * @param v_sq_snapshot       [in] Snapshot of squared velocities of all particles.
  * @param r_out               [out] Pointer to store the output radial position (kpc) after time `h`.
  * @param v_out               [out] Pointer to store the output radial velocity (kpc/Myr) after time `h`.
+ * @param ell_out             [out] Pointer to store the output angular momentum (kpc\f$^2\f$/Myr) after time `h`.
  */
 static void doMicroLeapfrog(
     int i, int npts,
-    double r_in, double v_in, double ell,
+    double r_in, double v_in, double ell_in,
     double h,     // Total physical time interval for this leapfrog sequence.
     int N,        // Base subdivision factor.
     int subSteps, // Total number of kicks/drifts.
     double grav,
-    double *r_out, double *v_out)
+    double **particles,
+    double *rho_snapshot, double *v_sq_snapshot,
+    double *r_out, double *v_out, double *ell_out)
 {
     // Initialize current state with input values
     double r_curr = r_in;
     double v_curr = v_in;
+    double ell_curr = ell_in;
 
     // Set up timestep sizes based on subdivision level
     double halfKick, midStep;
@@ -3479,10 +3596,13 @@ static void doMicroLeapfrog(
         midStep = h / (2.0 * N);
     }
 
-    // Initial half-kick (velocity update)
+    // Initial half-kick (velocity and angular momentum update)
+    double dvdt_drag, dell_dt_drag;
+    drag_force(r_curr, v_curr, i, ell_curr, particles, rho_snapshot, v_sq_snapshot, npts, grav, &dvdt_drag, &dell_dt_drag);
     double force = gravitational_force(r_curr, i, npts, grav, g_active_halo_mass);
-    double dvdt = force + effective_angular_force(r_curr, ell);
+    double dvdt = force + effective_angular_force(r_curr, ell_curr) + dvdt_drag;
     v_curr += halfKick * dvdt;
+    ell_curr += halfKick * dell_dt_drag;
 
     // Middle pattern of drift-kick pairs
     int pairs = (subSteps - 1) / 2; // Total number of drift-kick pairs
@@ -3493,21 +3613,26 @@ static void doMicroLeapfrog(
         r_curr += midStep * v_curr;
 
         // Kick: update velocity using forces at new position
+        drag_force(r_curr, v_curr, i, ell_curr, particles, rho_snapshot, v_sq_snapshot, npts, grav, &dvdt_drag, &dell_dt_drag);
         force = gravitational_force(r_curr, i, npts, grav, g_active_halo_mass);
-        dvdt = force + effective_angular_force(r_curr, ell);
+        dvdt = force + effective_angular_force(r_curr, ell_curr) + dvdt_drag;
         v_curr += midStep * dvdt;
+        ell_curr += midStep * dell_dt_drag;
     }
 
     // Final full drift
     r_curr += midStep * v_curr;
 
     // Final half-kick
+    drag_force(r_curr, v_curr, i, ell_curr, particles, rho_snapshot, v_sq_snapshot, npts, grav, &dvdt_drag, &dell_dt_drag);
     force = gravitational_force(r_curr, i, npts, grav, g_active_halo_mass);
-    dvdt = force + effective_angular_force(r_curr, ell);
+    dvdt = force + effective_angular_force(r_curr, ell_curr) + dvdt_drag;
     v_curr += halfKick * dvdt;
+    ell_curr += halfKick * dell_dt_drag;
 
     *r_out = r_curr;
     *v_out = v_curr;
+    *ell_out = ell_curr;
 }
 
 /**
@@ -3528,59 +3653,86 @@ static void doMicroLeapfrog(
  * @param npts          [in] Total number of particles in the simulation.
  * @param r_in          [in] Initial radial position (kpc) at the start of the step `h`.
  * @param v_in          [in] Initial radial velocity (kpc/Myr) at the start of `h`.
- * @param ell           [in] Angular momentum per unit mass (kpc\f$^2\f$/Myr), conserved.
+ * @param ell           [in] Angular momentum per unit mass (kpc\f$^2\f$/Myr), not conserved.
  * @param h             [in] Full physical timestep size \f$\Delta T_{phys}\f$ (Myr).
  * @param radius_tol    [in] Relative convergence tolerance for radius comparison.
  * @param velocity_tol  [in] Relative convergence tolerance for velocity comparison.
  * @param max_subdiv    [in] Maximum allowed subdivision factor \f$N\f$ for micro-steps.
  * @param grav          [in] Gravitational constant G (simulation units, e.g., G_CONST).
+ * @param particles       [in] Particle data array.
+ * @param rho_snapshot    [in] snapshot of local density.
+ * @param v_sq_snapshot   [in] Snapshot of squared velocities of all particles.
  * @param out_type      [in] Result selection mode for converged integration:
  *                         0 for coarse result, 1 for fine result, 2 for Richardson extrapolation.
  * @param r_out         [out] Pointer to store the final radial position (kpc) after time `h`.
  * @param v_out         [out] Pointer to store the final radial velocity (kpc/Myr) after time `h`.
+ * @param ell_out         [out] Pointer to store the final angular momentum per unit mass (kpc\f$^2\f$/Myr) after time `h`.
  */
 static void doAdaptiveFullLeap(
     int i,               // Particle index for force computation
     int npts,            // Total number of particles in simulation
     double r_in,         // Initial radius at start of step
     double v_in,         // Initial velocity at start of step
-    double ell,          // Angular momentum (conserved during integration)
+    double ell_in,          // Angular momentum (conserved during integration)
     double h,            // Full physical timestep size ΔT
     double radius_tol,   // Convergence tolerance for radius
     double velocity_tol, // Convergence tolerance for velocity
     int max_subdiv,      // Maximum subdivision factor allowed
     double grav,         // Gravitational constant (renamed from G to avoid macro collision)
+    double **particles,    // Particle data array
+    double *rho_snapshot,  // Local density snapshot
+    double *v_sq_snapshot, // Local valocity-squared snapshot
     int out_type,        // Result selection: 0=coarse, 1=fine, 2=Richardson extrapolation
     double *r_out,       // Output parameter for final radius
-    double *v_out        // Output parameter for final velocity
+    double *v_out,        // Output parameter for final velocity
+    double *ell_out      // Output parameter for final angular momentum
 )
 {
     int N = 1; // Start with N=1 micro-steps.
 
     // Initialize coarse/fine results (first coarse pass).
-    double r_coarse = r_in, v_coarse = v_in;
-    double r_fine = r_in, v_fine = v_in;
+    double r_coarse = r_in, v_coarse = v_in, ell_coarse = ell_in;
+    double r_fine = r_in, v_fine = v_in, ell_fine = ell_in;
 
+    
     while (N <= max_subdiv)
     {
+        
         // Coarse pass (2N+1 steps)
         doMicroLeapfrog(
-            i, npts, r_in, v_in, ell,
+            i, npts, r_in, v_in, ell_in,
             h, N, (2 * N + 1),
-            grav,
-            &r_coarse, &v_coarse);
+            grav, particles,
+            rho_snapshot, v_sq_snapshot,
+            &r_coarse, &v_coarse, &ell_coarse);
 
         // Fine pass (4N+1 steps)
         doMicroLeapfrog(
-            i, npts, r_in, v_in, ell,
+            i, npts, r_in, v_in, ell_in,
             h, N, (4 * N + 1),
-            grav,
-            &r_fine, &v_fine);
+            grav, particles,
+            rho_snapshot, v_sq_snapshot,
+            &r_fine, &v_fine, &ell_fine);
 
         // Compare radius, velocity.
-        double radius_diff = fabs(r_fine - r_coarse) / (fabs(r_fine) + 1.0e-30);
-        double velocity_diff = fabs(v_fine - v_coarse) / (fabs(v_fine) + 1.0e-30);
 
+        /*
+        * old velocity calculation (radial only)
+        * double velocity_diff = fabs(v_fine - v_coarse) / (fabs(v_fine) + 1.0e-30);        
+        */
+
+        double vmag_fine =
+            sqrt(v_fine * v_fine + ell_fine * ell_fine / (r_fine * r_fine));
+
+        double vmag_coarse =
+            sqrt(v_coarse * v_coarse + ell_coarse * ell_coarse / (r_coarse * r_coarse));
+
+        double velocity_diff =
+            fabs(vmag_fine - vmag_coarse) /
+            (fabs(vmag_fine) + 1e-30);
+        double radius_diff = fabs(r_fine - r_coarse) / (fabs(r_fine) + 1.0e-30);
+
+        
         if ((radius_diff < radius_tol) && (velocity_diff < velocity_tol))
         {
             // Tolerances met => output according to out_type.
@@ -3588,17 +3740,20 @@ static void doAdaptiveFullLeap(
             {
                 *r_out = r_coarse;
                 *v_out = v_coarse;
+                *ell_out = ell_coarse;
             }
             else if (out_type == 1)
             {
                 *r_out = r_fine;
                 *v_out = v_fine;
+                *ell_out = ell_fine;
             }
             else
             {
                 // Richardson extrapolation for higher-order result
                 *r_out = 4.0 * r_fine - 3.0 * r_coarse;
                 *v_out = 4.0 * v_fine - 3.0 * v_coarse;
+                *ell_out = 4.0 * ell_fine - 3.0 * ell_coarse;
             }
             return; // Done.
         }
@@ -3615,16 +3770,19 @@ static void doAdaptiveFullLeap(
     {
         *r_out = r_coarse;
         *v_out = v_coarse;
+        *ell_out = ell_coarse;
     }
     else if (out_type == 1)
     {
         *r_out = r_fine;
         *v_out = v_fine;
+        *ell_out = ell_fine;
     }
     else
     {
         *r_out = 4.0 * r_fine - 3.0 * r_coarse;
         *v_out = 4.0 * v_fine - 3.0 * v_coarse;
+        *ell_out = 4.0 * ell_fine - 3.0 * ell_coarse;
     }
 }
 
@@ -3669,18 +3827,35 @@ static inline double dRhoDtaufun(double rhoVal, double vVal)
  * @param grav       [in] Gravitational constant G (simulation units).
  * @param ell        [in] Angular momentum per unit mass (kpc\f$^2\f$/Myr).
  * @param rhoVal     [in] Current value of the regularized radial coordinate \f$\rho = \sqrt{r}\f$.
- * @return double    \f$dv/d\tau\f$ in Levi-Civita coordinates (kpc\f$^2\f$/Myr\f$^2\f$).
+ * @param particles       [in] Particle data array.
+ * @param rho_snapshot    [in] snapshot of local density.
+ * @param v_sq_snapshot   [in] Snapshot of squared velocities of all particles.
+ * @param fLC_out         [out] Total \f$dv/d\tau\f$ (gravity + centrifugal + \f$\rho^2\f$-scaled
+ *                              drag) at this evaluation point.
+ * @param dell_dtau_out         [out] \f$d\ell/d\tau\f$, the \f$\rho^2\f$-scaled drag contribution to
+ *                                    angular momentum loss at this evaluation point.
  */
 static inline double forceLCfun(
     int i, int npts,
     double totalmass,
     double grav,
     double ell,
-    double rhoVal)
+    double rhoVal,
+    double v_rad,
+    double** particles,
+    double* rho_snapshot, double* v_sq_snapshot,
+    double* fLC_out, double* dell_dtau_out)
 {
     double gravPart = gravitational_force_rho_v(rhoVal, i, npts, grav, totalmass);
     double angPart = effective_angular_force_rho_v(rhoVal, ell);
-    return gravPart + angPart;
+
+    double r_phys = rhoVal * rhoVal; // Currently uses r, may be wise to calculate the drag using ρ in future optimization 
+    double dvdt_drag, dell_dt_drag;
+    drag_force(r_phys, v_rad, i, ell, particles, rho_snapshot, v_sq_snapshot, npts, grav, &dvdt_drag, &dell_dt_drag);
+
+    double rho_sq = r_phys;   // ρ² factor: dτ → dt_phys conversion
+    *fLC_out = gravPart + angPart + rho_sq * dvdt_drag;
+    *dell_dtau_out = rho_sq * dell_dt_drag;
 }
 
 /**
@@ -3698,25 +3873,33 @@ static inline double forceLCfun(
  * @param npts      [in] Total number of particles.
  * @param r_in      [in] Initial physical radial position (kpc) at the start of the physical step `dt`.
  * @param v_in      [in] Initial physical radial velocity (kpc/Myr) at the start of `dt`.
- * @param ell       [in] Angular momentum per unit mass (kpc\f$^2\f$/Myr) for the force calculation.
+ * @param ell_in    [in] Angular momentum per unit mass (kpc\f$^2\f$/Myr) for the force calculation.
  * @param dt        [in] The full physical timestep \f$\Delta T_{phys}\f$ (Myr) to advance the particle.
  * @param N_taumin  [in] Target number of fictitious \f$τ\f$-steps within the `dt` interval; influences
  *                     the initial guess for \f$Δτ\f$.
  * @param grav      [in] Gravitational constant G (simulation units).
+ * @param particles     [in] Particle data array (rows: position, radial velocity, angular
+ *                          momentum, ..., mass), passed through to `forceLCfun`/`drag_force`
+ *                          for the particle's mass.
+ * @param rho_snapshot  [in] Snapshot of local density, indexed by rank.
+ * @param v_sq_snapshot [in] Snapshot of squared total velocities of all particles, indexed by rank.
  * @param r_out     [out] Pointer to store the final physical radial position (kpc) after time `dt`.
  * @param v_out     [out] Pointer to store the final physical radial velocity (kpc/Myr) after time `dt`.
+ * @param ell_out       [out] Pointer to store the final angular momentum per unit mass
+ *                          (kpc\f$^2\f$/Myr) after time `dt`, reflecting any drag-driven loss
+ *                          accumulated over the step.
  */
 static void doLeviCivitaLeapfrog(
     int i,
     int npts,
     double r_in,
     double v_in,
-    double ell,
+    double ell_in,
     double dt,
     int N_taumin,
     double grav,
-    double *r_out,
-    double *v_out)
+    double** particles, double* rho_snapshot, double* v_sq_snapshot,
+    double* r_out, double* v_out, double* ell_out)
 {
     // Transform to Levi-Civita coordinates: rho = sqrt(r)
     double rho = sqrt(r_in);
@@ -3740,6 +3923,7 @@ static void doLeviCivitaLeapfrog(
     double v_cur = v_rad;
     double tau_cur = tau;
     double t_phys = t_cur;
+    double ell_cur = ell_in;
 
     int stepCount = 0;
     int stepMax = 200000000; // Maximum step count to prevent infinite loops.
@@ -3753,17 +3937,23 @@ static void doLeviCivitaLeapfrog(
         }
 
         // Leapfrog step 1: Evaluate force at current position
-        double fval = forceLCfun(i, npts, g_active_halo_mass, grav, ell, rho_cur);
+        double fval, dell_dtau1;
+        forceLCfun(i, npts, g_active_halo_mass, grav, ell_cur, rho_cur, v_cur,
+                   particles, rho_snapshot, v_sq_snapshot, &fval, &dell_dtau1);
 
         // Leapfrog step 2: First half-kick for velocity
         double v_half = v_cur + 0.5 * deltaTau * fval;
+        double ell_half = ell_cur + 0.5 * deltaTau * dell_dtau1;
 
         // Leapfrog step 3: Full drift for position
         double rho_next = rho_cur + deltaTau * dRhoDtaufun(rho_cur, v_half);
 
         // Leapfrog step 4: Second half-kick with force at new position
-        double fval2 = forceLCfun(i, npts, g_active_halo_mass, grav, ell, rho_next);
+        double fval2, dell_dtau2;
+        forceLCfun(i, npts, g_active_halo_mass, grav, ell_half, rho_next, v_half,
+                   particles, rho_snapshot, v_sq_snapshot, &fval2, &dell_dtau2);
         double v_next = v_half + 0.5 * deltaTau * fval2;
+        double ell_next = ell_half + 0.5 * deltaTau * dell_dtau2;
 
         // Update physical time using midpoint rho value
         double rho_mid = 0.5 * (rho_cur + rho_next);
@@ -3787,11 +3977,13 @@ static void doLeviCivitaLeapfrog(
             // Interpolate state to exact target time
             double rho_f = rho_cur + alpha * (rho_next - rho_cur);
             double v_f = v_cur + alpha * (v_next - v_cur);
+            double ell_f = ell_cur + alpha * (ell_next - ell_cur);
 
             // Transform back to physical coordinates
             double r_f = rho_f * rho_f;
             *r_out = r_f;
             *v_out = v_f;
+            *ell_out = ell_f;
             return;
         }
 
@@ -3800,6 +3992,7 @@ static void doLeviCivitaLeapfrog(
         v_cur = v_next;
         tau_cur = tau_next;
         t_phys = t_next;
+        ell_cur = ell_next;
 
         stepCount++;
         if (stepCount > stepMax)
@@ -3807,6 +4000,7 @@ static void doLeviCivitaLeapfrog(
             // Safety exit if maximum iteration count exceeded
             *r_out = rho_cur * rho_cur;
             *v_out = v_cur;
+            *ell_out = ell_cur;
             return;
         }
     }
@@ -3814,7 +4008,7 @@ static void doLeviCivitaLeapfrog(
     // Transform final state back to physical coordinates
     *r_out = rho_cur * rho_cur;
     *v_out = v_cur;
-
+    *ell_out = ell_cur;
     return;
 }
 
@@ -3843,10 +4037,18 @@ static void doLeviCivitaLeapfrog(
  * @param subSteps  [in] Number of fixed micro-steps to perform over `h_tau`.
  * @param h_tau     [in] Total fictitious time interval \f$Δτ_{total}\f$ for this integration sequence.
  * @param grav      [in] Gravitational constant G (simulation units).
- * @param ell       [in] Angular momentum per unit mass (kpc\f$^2\f$/Myr).
+ * @param ell_in    [in] Angular momentum per unit mass (kpc\f$^2\f$/Myr).
+ * @param particles     [in] Particle data array (rows: position, radial velocity, angular
+ *                          momentum, ..., mass), passed through to `forceLCfun`/`drag_force`
+ *                          for the particle's mass.
+ * @param rho_snapshot  [in] Snapshot of local density, indexed by rank.
+ * @param v_sq_snapshot [in] Snapshot of squared total velocities of all particles, indexed by rank.
  * @param rho_out   [out] Pointer to store the final \f$ρ\f$ after `h_tau`.
  * @param v_out     [out] Pointer to store the final \f$v_{rad}\f$ after `h_tau`.
  * @param t_out     [out] Pointer to store the final accumulated \f$t_{phys}\f$ after `h_tau`.
+ * @param ell_out       [out] Pointer to store the final angular momentum per unit mass
+ *                          (kpc\f$^2\f$/Myr) after time `dt`, reflecting any drag-driven loss
+ *                          accumulated over the step.
  */
 static void doMicroLeviCivita(
     int i,
@@ -3857,29 +4059,38 @@ static void doMicroLeviCivita(
     int subSteps,
     double h_tau,
     double grav,
-    double ell,
+    double ell_in,
+    double **particles, double *rho_snapshot, double *v_sq_snapshot,
     double *rho_out,
     double *v_out,
-    double *t_out)
+    double *t_out,
+    double *ell_out)
 {
 
     double dtau = h_tau / (double)subSteps;
     double rho_curr = rho_in;
     double v_curr = v_in;
     double t_curr = t_in;
+    double ell_curr = ell_in;
 
     for (int ss = 0; ss < subSteps; ss++)
     {
         // Half-kick.
-        double fLC = forceLCfun(i, npts, g_active_halo_mass, grav, ell, rho_curr);
+        double fLC, dell_dtau1;
+        forceLCfun(i, npts, g_active_halo_mass, grav, ell_curr, rho_curr, v_curr,
+                   particles, rho_snapshot, v_sq_snapshot, &fLC, &dell_dtau1);
         double v_half = v_curr + 0.5 * dtau * fLC;
+        double ell_half = ell_curr + 0.5 * dtau * dell_dtau1;
 
         // Drift for rho.
         double rho_next = rho_curr + dtau * (0.5 * rho_curr * v_half);
 
         // Second half-kick.
-        double fLC2 = forceLCfun(i, npts, g_active_halo_mass, grav, ell, rho_next);
+        double fLC2, dell_dtau2;
+        forceLCfun(i, npts, g_active_halo_mass, grav, ell_half, rho_next, v_half,
+                   particles, rho_snapshot, v_sq_snapshot, &fLC2, &dell_dtau2);
         double v_next = v_half + 0.5 * dtau * fLC2;
+        double ell_next = ell_half + 0.5 * dtau * dell_dtau2;
 
         // Accumulate physical time t(τ).
         // Simplest approach: use midpoint for rho =>  ρ_mid^2.
@@ -3889,11 +4100,13 @@ static void doMicroLeviCivita(
         t_curr += dt_phys;
         rho_curr = rho_next;
         v_curr = v_next;
+        ell_curr = ell_next;
     }
 
     *rho_out = rho_curr;
     *v_out = v_curr;
     *t_out = t_curr;
+    *ell_out = ell_curr;
 }
 
 /**
@@ -3920,11 +4133,19 @@ static void doMicroLeviCivita(
  * @param velocity_tol  [in] Relative convergence tolerance for \f$v_{rad}\f$ comparison.
  * @param max_subdiv    [in] Maximum subdivision factor \f$N\f$ for micro-steps within `doMicroLeviCivita`.
  * @param grav          [in] Gravitational constant G (simulation units).
- * @param ell           [in] Angular momentum per unit mass (kpc\f$^2\f$/Myr).
+ * @param ell_in        [in] Angular momentum per unit mass (kpc\f$^2\f$/Myr).
  * @param out_type      [in] Result selection for converged micro-integration: 0=coarse, 1=fine, 2=Richardson.
- * @param rho_out       [out] Pointer to store the final \f$ρ\f$ after the adaptive \f$Δτ_{guess}\f$ step.
- * @param v_out         [out] Pointer to store the final \f$v_{rad}\f$ after the adaptive \f$Δτ_{guess}\f$ step.
- * @param t_out         [out] Pointer to store the final accumulated physical time \f$t_{phys}\f$ after this step.
+ * @param particles     [in] Particle data array (rows: position, radial velocity, angular
+ *                          momentum, ..., mass), passed through to `forceLCfun`/`drag_force`
+ *                          for the particle's mass.
+ * @param rho_snapshot  [in] Snapshot of local density, indexed by rank.
+ * @param v_sq_snapshot [in] Snapshot of squared total velocities of all particles, indexed by rank.
+ * @param rho_out   [out] Pointer to store the final \f$ρ\f$ after `h_tau`.
+ * @param v_out     [out] Pointer to store the final \f$v_{rad}\f$ after `h_tau`.
+ * @param t_out     [out] Pointer to store the final accumulated \f$t_{phys}\f$ after `h_tau`.
+ * @param ell_out       [out] Pointer to store the final angular momentum per unit mass
+ *                          (kpc\f$^2\f$/Myr) after time `dt`, reflecting any drag-driven loss
+ *                          accumulated over the step.
  */
 static void doSingleTauStepAdaptiveLeviCivita(
     int i, int npts,
@@ -3936,11 +4157,13 @@ static void doSingleTauStepAdaptiveLeviCivita(
     double velocity_tol,
     int max_subdiv,
     double grav,
-    double ell,
+    double ell_in,
     int out_type,
+    double** particles, double* rho_snapshot, double* v_sq_snapshot,
     double *rho_out,
     double *v_out,
-    double *t_out)
+    double *t_out,
+    double *ell_out)
 {
     // Initialize with the smallest subdivision factor N=1
     int N = 1;
@@ -3948,28 +4171,28 @@ static void doSingleTauStepAdaptiveLeviCivita(
     while (N <= max_subdiv)
     {
         // COARSE integration: use subSteps = 2N+1
-        double rhoC, vC, tC;
+        double rhoC, vC, tC, ellC;
         doMicroLeviCivita(
             i, npts,
-            rho_in, v_in,
-            t_in,
+            rho_in, v_in, t_in,
             (2 * N + 1),
             h_guess,
             grav,
-            ell,
-            &rhoC, &vC, &tC);
+            ell_in,
+            particles, rho_snapshot, v_sq_snapshot,
+            &rhoC, &vC, &tC, &ellC);
 
         // FINE integration: use subSteps = 4N+1
-        double rhoF, vF, tF;
+        double rhoF, vF, tF, ellF;
         doMicroLeviCivita(
             i, npts,
-            rho_in, v_in,
-            t_in,
+            rho_in, v_in, t_in,
             (4 * N + 1),
             h_guess,
             grav,
-            ell,
-            &rhoF, &vF, &tF);
+            ell_in,
+            particles, rho_snapshot, v_sq_snapshot,
+            &rhoF, &vF, &tF, &ellF);
 
         // Compare final radius and velocity for convergence
         // Calculate relative differences between coarse and fine solutions
@@ -3977,7 +4200,20 @@ static void doSingleTauStepAdaptiveLeviCivita(
         double rF = rhoF * rhoF;
 
         double rhodif = fabs(rhoF - rhoC) / (fabs(rF) + 1.0e-30); // Relative radial difference
+
+        double vmag_fine =
+            sqrt(vF * vF + ellF * ellF / (rhoF * rhoF));
+
+        double vmag_coarse =
+            sqrt(vC * vC + ellC * ellC / (rhoC * rhoC));
+
+        double vdif = // Relative velocity difference
+            fabs(vmag_fine - vmag_coarse) /
+            (fabs(vmag_fine) + 1e-30);
+        /*
+        * old calculation
         double vdif = fabs(vF - vC) / (fabs(vF) + 1.0e-30);       // Relative velocity difference
+        */
 
         if ((rhodif < radius_tol) && (vdif < velocity_tol))
         {
@@ -3986,12 +4222,14 @@ static void doSingleTauStepAdaptiveLeviCivita(
                 *rho_out = rhoC;
                 *v_out = vC;
                 *t_out = tC;
+                *ell_out = ellC;
             }
             else if (out_type == 1)
             {
                 *rho_out = rhoF;
                 *v_out = vF;
                 *t_out = tF;
+                *ell_out = ellF;
             }
             else
             {
@@ -4000,6 +4238,7 @@ static void doSingleTauStepAdaptiveLeviCivita(
                 double rho_rich = 4.0 * rhoF - 3.0 * rhoC; // Extrapolated ρ value
                 double v_rich = 4.0 * vF - 3.0 * vC;       // Extrapolated velocity
                 double t_rich = 4.0 * tF - 3.0 * tC;       // Extrapolated time value
+                double ell_rich = 4.0 * ellF - 3.0 * ellC; // Extrapolated angular momentum value
 
                 // Ensure non-negative radius
                 if (rho_rich < 0.0)
@@ -4007,6 +4246,7 @@ static void doSingleTauStepAdaptiveLeviCivita(
                 *rho_out = rho_rich;
                 *v_out = v_rich;
                 *t_out = t_rich;
+                *ell_out = ell_rich;
             }
             return;
         }
@@ -4020,20 +4260,21 @@ static void doSingleTauStepAdaptiveLeviCivita(
     // Convergence not achieved within max_subdiv iterations
     // Use highest-resolution fine integration as fallback result
     {
-        double rhoF, vF, tF;
+        double rhoF, vF, tF, ellF;
         doMicroLeviCivita(
             i, npts,
-            rho_in, v_in,
-            t_in,
+            rho_in, v_in, t_in,
             (4 * N + 1),
             h_guess,
             grav,
-            ell,
-            &rhoF, &vF, &tF);
+            ell_in,
+            particles, rho_snapshot, v_sq_snapshot,
+            &rhoF, &vF, &tF, &ellF);
 
         *rho_out = rhoF;
         *v_out = vF;
         *t_out = tF;
+        *ell_out = ellF;
     }
 }
 
@@ -4064,15 +4305,23 @@ static void doSingleTauStepAdaptiveLeviCivita(
  * @param grav          [in] Gravitational constant G (simulation units, e.g., G_CONST).
  * @param out_type      [in] Result selection mode for micro-steps within `doSingleTauStepAdaptiveLeviCivita`:
  *                         0 for coarse, 1 for fine, 2 for Richardson extrapolation.
+ * @param particles     [in] Particle data array (rows: position, radial velocity, angular
+ *                          momentum, ..., mass), passed through to `forceLCfun`/`drag_force`
+ *                          for the particle's mass.
+ * @param rho_snapshot  [in] Snapshot of local density, indexed by rank.
+ * @param v_sq_snapshot [in] Snapshot of squared total velocities of all particles, indexed by rank.
  * @param r_out         [out] Pointer to store the final physical radial position (kpc) after time `dt`.
  * @param v_out         [out] Pointer to store the final physical radial velocity (kpc/Myr) after time `dt`.
+ * @param ell_out       [out] Pointer to store the final angular momentum per unit mass
+ *                          (kpc\f$^2\f$/Myr) after time `dt`, reflecting any drag-driven loss
+ *                          accumulated over the step.
  */
 static void doAdaptiveFullLeviCivita(
     int i,
     int npts,
     double r_in,
     double v_in,
-    double ell,
+    double ell_in,
     double dt, // big step in physical time
     int N_taumin,
     double radius_tol,
@@ -4080,8 +4329,10 @@ static void doAdaptiveFullLeviCivita(
     int max_subdiv,
     double grav,
     int out_type, // 0=coarse,1=fine,2=Richardson
+    double** particles, double* rho_snapshot, double* v_sq_snapshot,
     double *r_out,
-    double *v_out)
+    double *v_out,
+    double *ell_out)
 {
     // Handle near-zero radius edge case
     if (r_in < 1.0e-30)
@@ -4094,6 +4345,7 @@ static void doAdaptiveFullLeviCivita(
     // Transform from physical to regularized coordinates
     double rho_current = sqrt(r_in);
     double v_current = v_in;
+    double ell_current = ell_in;
 
     double t_cur = 0.0; // Current physical time.
 
@@ -4116,7 +4368,7 @@ static void doAdaptiveFullLeviCivita(
         if (t_cur >= dt)
             break; // Exit when physical time target is reached
 
-        double rho_next, v_next, t_next;
+        double rho_next, v_next, t_next, ell_next;
         doSingleTauStepAdaptiveLeviCivita(
             i, npts,
             rho_current, v_current,
@@ -4126,9 +4378,10 @@ static void doAdaptiveFullLeviCivita(
             velocity_tol,
             max_subdiv,
             grav,
-            ell,
+            ell_current,
             out_type,
-            &rho_next, &v_next, &t_next);
+            particles, rho_snapshot, v_sq_snapshot,
+            &rho_next, &v_next, &t_next, &ell_next);
 
         if (t_next > dt)
         {
@@ -4140,10 +4393,12 @@ static void doAdaptiveFullLeviCivita(
             // Interpolate to exact target time dt
             double rho_final = rho_current + alpha * (rho_next - rho_current);
             double v_final = v_current + alpha * (v_next - v_current);
+            double ell_final = ell_current + alpha * (ell_next * ell_current);
 
             double r_fin = rho_final * rho_final;
             *r_out = r_fin;
             *v_out = v_final;
+            *ell_out = ell_final;
             return;
         }
         else
@@ -4152,6 +4407,7 @@ static void doAdaptiveFullLeviCivita(
             rho_current = rho_next;
             v_current = v_next;
             t_cur = t_next;
+            ell_current = ell_next;
         }
 
         // Check for iteration limit
@@ -4162,6 +4418,7 @@ static void doAdaptiveFullLeviCivita(
             double r_fin = rho_current * rho_current;
             *r_out = r_fin;
             *v_out = v_current;
+            *ell_out = ell_current;
             return;
         }
     }
@@ -4170,6 +4427,7 @@ static void doAdaptiveFullLeviCivita(
     double r_fin = rho_current * rho_current;
     *r_out = r_fin;
     *v_out = v_current;
+    *ell_out = ell_current;
 }
 
 // =============================================================================
@@ -4349,7 +4607,7 @@ static void initialize_particle_masses(double** particles, int npts)
         int n_dm = 0;
         double m_dm;
         double m_bar;
-        double mass_ratio = 100000; //ratio of masses m_bar/m_dm
+        double mass_ratio = 100; //ratio of masses m_bar/m_dm
         for (int i = 0; i < npts; i++)
             n_dm += particles[7][i];
         m_dm = g_active_halo_mass / (npts + (mass_ratio-1) * n_dm);
@@ -9528,7 +9786,7 @@ cleanup_diag_iteration:
     
                 particles[3][k_nfw] = (double)k_nfw; // Particle ID
 
-                double bar_dm_ratio = 0.2;
+                double bar_dm_ratio = 0.15;
                 double random_chance = (double)rand() / (double)RAND_MAX;
                 if (random_chance < bar_dm_ratio) // Random assignment of species @TEST@
                     particles[7][k_nfw] = 1;
@@ -13123,13 +13381,34 @@ cleanup_diag_iteration:
     // Initialize pre-calculated force constant to avoid repeated divisions
     g_precalc_force_const = -(VEL_CONV_SQ * G_CONST) * (g_active_halo_mass / (double)npts);
 
-    // Initialize prefix sum of masses
+    /*
     g_mass_prefix_sum[0] = 0.0;
     for (int i = 1; i < npts; i++)
         g_mass_prefix_sum[i] = g_mass_prefix_sum[i - 1] + particles[8][i - 1];
+    */
 
     if (!skip_simulation)
     {
+        // Allocate and initialize prefix sum of masses
+        g_mass_prefix_sum = (double*)malloc(npts * sizeof(double));
+        if (!g_mass_prefix_sum) {
+            fprintf(stderr, "ERROR: Failed to allocate prefix sum of masses\n");
+            CLEAN_EXIT(1);
+        }
+
+        // Frozen per-step snapshots for drag_force's neighbor sampling
+        double* rho_snapshot = (double*)malloc(npts * sizeof(double));
+        if (!rho_snapshot) {
+            fprintf(stderr, "ERROR: Failed to allocate radius snapshot for dynamic drag calculation\n");
+            CLEAN_EXIT(1);
+        }
+
+        double* v_sq_snapshot = (double*)malloc(npts * sizeof(double));
+        if (!v_sq_snapshot) {
+            fprintf(stderr, "ERROR: Failed to allocate velocity squared snapshot dor dynamic drag calculation\n");
+            CLEAN_EXIT(1);
+        }
+
         for (int j = 0; j < Ntimes; j++) // Main time loop
         {
             int current_step;
@@ -13158,7 +13437,15 @@ cleanup_diag_iteration:
                 }
 
 #pragma omp barrier
-
+#pragma omp parallel for default(shared) schedule(static)
+                for (int k = 0; k < npts; k++)
+                {
+                    double rk = particles[0][k];
+                    double vradk = particles[1][k];
+                    double ellk = particles[2][k];
+                    rho_snapshot[k] = calculate_rho(particles, k, g_mass_prefix_sum, npts);
+                    v_sq_snapshot[k] = vradk * vradk + ellk * ellk / (rk * rk);
+                }
 #pragma omp parallel for default(shared) schedule(static)
                 {
                     for (int idx = 0; idx < npts; idx++)
@@ -13241,6 +13528,15 @@ cleanup_diag_iteration:
                 }
 
 #pragma omp barrier
+#pragma omp parallel for default(shared) schedule(static)
+                for (int k = 0; k < npts; k++)
+                {
+                    double rk = particles[0][k];
+                    double vradk = particles[1][k];
+                    double ellk = particles[2][k];
+                    rho_snapshot[k] = calculate_rho(particles, k, g_mass_prefix_sum, npts);
+                    v_sq_snapshot[k] = vradk * vradk + ellk * ellk / (rk * rk);
+                }
 #pragma omp parallel for default(shared) schedule(static)
                 for (int idx = 0; idx < npts; idx++)
                 {
@@ -13330,6 +13626,15 @@ cleanup_diag_iteration:
                     rebuild_mass_prefix_sum(particles, npts);
                 }
 #pragma omp barrier
+#pragma omp parallel for default(shared) schedule(static)
+                for (int k = 0; k < npts; k++)
+                {
+                    double rk = particles[0][k];
+                    double vradk = particles[1][k];
+                    double ellk = particles[2][k];
+                    rho_snapshot[k] = calculate_rho(particles, k, g_mass_prefix_sum, npts);
+                    v_sq_snapshot[k] = vradk * vradk + ellk * ellk / (rk * rk);
+                }
 
 #pragma omp parallel for default(shared) schedule(static)
                 for (int idx = 0; idx < npts; idx++)
@@ -13414,6 +13719,16 @@ cleanup_diag_iteration:
                     sort_particles(particles, npts);
                     rebuild_mass_prefix_sum(particles, npts);
                 }
+#pragma omp parallel for default(shared) schedule(static)
+                for (int k = 0; k < npts; k++)
+                {
+                    double rk = particles[0][k];
+                    double vradk = particles[1][k];
+                    double ellk = particles[2][k];
+                    rho_snapshot[k] = calculate_rho(particles, k, g_mass_prefix_sum, npts);
+                    v_sq_snapshot[k] = vradk * vradk + ellk * ellk / (rk * rk);
+                }
+
                 /**
                  * @brief Main integration loop - adaptive leapfrog update for each particle.
                  * @details Each particle is advanced independently using adaptive timestepping.
@@ -13426,7 +13741,7 @@ cleanup_diag_iteration:
                     double ell = particles[2][i];
 
                     // One full step => h = dt.
-                    double r_new, v_new;
+                    double r_new, v_new, ell_new;
                     doAdaptiveFullLeap(
                         i, npts,
                         r, v,
@@ -13435,11 +13750,15 @@ cleanup_diag_iteration:
                         radius_tol, velocity_tol,
                         max_subdiv,
                         G_CONST,
+                        particles,
+                        rho_snapshot,
+                        v_sq_snapshot,
                         out_type,
-                        &r_new, &v_new);
+                        &r_new, &v_new, &ell_new);
 
                     particles[0][i] = r_new;
                     particles[1][i] = v_new;
+                    particles[2][i] = ell_new;
                 }
 
                 /**
@@ -13512,8 +13831,8 @@ cleanup_diag_iteration:
                  *          dynamically calculated for each particle.
                  */
 
-                double velocity_tol = 1.0e-8;
-                double radius_tol = 1.0e-8;
+                double velocity_tol = 1.0e-5;
+                double radius_tol = 1.0e-5;
                 int max_subdiv = 4096 * 4096;
                 int out_type = 2;
                 int N_taumin = 1000;
@@ -13525,6 +13844,16 @@ cleanup_diag_iteration:
                     sort_particles(particles, npts);
                     rebuild_mass_prefix_sum(particles, npts);
                 }
+#pragma omp parallel for default(shared) schedule(static)
+                for (int k = 0; k < npts; k++)
+                {
+                    double rk = particles[0][k];
+                    double vradk = particles[1][k];
+                    double ellk = particles[2][k];
+                    rho_snapshot[k] = calculate_rho(particles, k, g_mass_prefix_sum, npts);
+                    v_sq_snapshot[k] = vradk * vradk + ellk * ellk / (rk * rk);
+                }
+
                 /**
                  * @brief Main integration loop - method selection based on orbital parameters.
                  * @details Dynamically selects between standard leapfrog and Levi-Civita
@@ -13551,7 +13880,7 @@ cleanup_diag_iteration:
                         r_crit = 0.0;
                     }
 
-                    double r_new, v_new;
+                    double r_new, v_new, ell_new;
 
                     if (((r > 1.0e-30) && (r < r_crit)) || (r < r_crit_min))
                     {
@@ -13562,7 +13891,10 @@ cleanup_diag_iteration:
                             dt,
                             N_taumin,
                             G_CONST,
-                            &r_new, &v_new);
+                            particles,
+                            rho_snapshot,
+                            v_sq_snapshot,
+                            &r_new, &v_new, &ell_new);
                     }
                     else
                     {
@@ -13574,12 +13906,16 @@ cleanup_diag_iteration:
                             radius_tol, velocity_tol,
                             max_subdiv,
                             G_CONST,
+                            particles,
+                            rho_snapshot,
+                            v_sq_snapshot,
                             out_type,
-                            &r_new, &v_new);
+                            &r_new, &v_new, &ell_new);
                     }
 
                     particles[0][i] = r_new;
                     particles[1][i] = v_new;
+                    particles[2][i] = ell_new;
                 }
 
 #pragma omp parallel for default(shared) schedule(static)
@@ -13635,9 +13971,9 @@ cleanup_diag_iteration:
             }
             else if (method_select == 5)
             {
-                double velocity_tol = 1.0e-7;
-                double radius_tol = 1.0e-7;
-                int max_subdiv = 4096 * 4096 * 16;
+                double velocity_tol = 1.0e-3;
+                double radius_tol = 1.0e-5;
+                int max_subdiv = 4096 * 4096;
                 int out_type = 2;
                 int N_taumin = 10;
                 double alpha_param = 0.05;
@@ -13646,6 +13982,16 @@ cleanup_diag_iteration:
                 {
                     sort_particles(particles, npts);
                     rebuild_mass_prefix_sum(particles, npts);
+                }
+#pragma omp barrier
+#pragma omp parallel for default(shared) schedule(static)
+                for (int k = 0; k < npts; k++)
+                {
+                    double rk = particles[0][k];
+                    double vradk = particles[1][k];
+                    double ellk = particles[2][k];
+                    rho_snapshot[k] = calculate_rho(particles, k, g_mass_prefix_sum, npts);
+                    v_sq_snapshot[k] = vradk * vradk + ellk * ellk / (rk * rk);
                 }
 
 #pragma omp parallel for default(shared) schedule(static)
@@ -13659,12 +14005,14 @@ cleanup_diag_iteration:
                 double current_active_rc_for_sidm = g_use_hernquist_aniso_profile ? g_scale_radius_param : (g_use_nfw_profile ? g_nfw_profile_rc : g_cored_profile_rc);
                 handle_sidm_step(particles, npts, dt, time, current_active_rc_for_sidm, display_method, 0, g_current_timestep_scatter_counts, rng_timestep);
 
-#pragma omp parallel for default(shared) schedule(static)
+#pragma omp parallel for default(shared) schedule(dynamic)
                 for (int i = 0; i < npts; i++)
                 {
                     double r = particles[0][i];
                     double v = particles[1][i];
                     double ell = particles[2][i];
+
+                    double local_start = omp_get_wtime(); //@DEBUG@
 
                     // Calculate r_crit, using special handling for particle i=0 (M_enc=0) to avoid division by zero.
                     double r_crit = 0.0;
@@ -13684,25 +14032,30 @@ cleanup_diag_iteration:
                         r_crit = (ell * ell) * alpha_param / gravPart;
                     }
 
-                    double r_new, v_new;
+                    double r_new, v_new, ell_new;
                     if (r > 1.0e-30 && r < r_crit) // Switch based on critical radius
                     {
                         doAdaptiveFullLeviCivita(
                             i, npts, r, v, ell, dt, N_taumin,
                             radius_tol, velocity_tol, max_subdiv,
-                            G_CONST, out_type, &r_new, &v_new);
+                            G_CONST, out_type,
+                            particles, rho_snapshot, v_sq_snapshot,
+                            &r_new, &v_new, &ell_new);
                     }
                     else
                     {
                         doAdaptiveFullLeap(
                             i, npts, r, v, ell, dt,
                             radius_tol, velocity_tol, max_subdiv,
-                            G_CONST, out_type, &r_new, &v_new);
+                            G_CONST, particles,
+                            rho_snapshot, v_sq_snapshot, 
+                            out_type, &r_new, &v_new, &ell_new);
                     }
+                    
                     particles[0][i] = r_new;
                     particles[1][i] = v_new;
+                    particles[2][i] = ell_new;
                 }
-
                 // Record trajectory data at every timestep into buffer
 #pragma omp single
                     {
@@ -13785,6 +14138,15 @@ cleanup_diag_iteration:
                 }
 
 #pragma omp barrier
+#pragma omp parallel for default(shared) schedule(static)
+                for (int k = 0; k < npts; k++)
+                {
+                    double rk = particles[0][k];
+                    double vradk = particles[1][k];
+                    double ellk = particles[2][k];
+                    rho_snapshot[k] = calculate_rho(particles, k, g_mass_prefix_sum, npts);
+                    v_sq_snapshot[k] = vradk * vradk + ellk * ellk / (rk * rk);
+                }
 #pragma omp parallel for default(shared) schedule(static)
                 for (int idx = 0; idx < npts; idx++)
                 {
@@ -13978,6 +14340,15 @@ cleanup_diag_iteration:
 
 #pragma omp barrier
 #pragma omp parallel for default(shared) schedule(static)
+                for (int k = 0; k < npts; k++)
+                {
+                    double rk = particles[0][k];
+                    double vradk = particles[1][k];
+                    double ellk = particles[2][k];
+                    rho_snapshot[k] = calculate_rho(particles, k, g_mass_prefix_sum, npts);
+                    v_sq_snapshot[k] = vradk * vradk + ellk * ellk / (rk * rk);
+                }
+#pragma omp parallel for default(shared) schedule(static)
                 for (int idx = 0; idx < npts; idx++)
                 {
                     int orig_id = (int)particles[3][idx];
@@ -14128,6 +14499,16 @@ cleanup_diag_iteration:
                         {
                             sort_particles(particles, npts);
                             rebuild_mass_prefix_sum(particles, npts);
+
+#pragma omp parallel for default(shared) schedule(static)
+                            for (int k = 0; k < npts; k++)
+                            {
+                                double rk = particles[0][k];
+                                double vradk = particles[1][k];
+                                double ellk = particles[2][k];
+                                rho_snapshot[k] = calculate_rho(particles, k, g_mass_prefix_sum, npts);
+                                v_sq_snapshot[k] = vradk * vradk + ellk * ellk / (rk * rk);
+                            }
 #pragma omp parallel for default(shared) schedule(static)
                             for (int idx = 0; idx < npts; idx++)
                             {
@@ -14215,6 +14596,15 @@ cleanup_diag_iteration:
 
 #pragma omp barrier
 #pragma omp parallel for default(shared) schedule(static)
+                    for (int k = 0; k < npts; k++)
+                    {
+                        double rk = particles[0][k];
+                        double vradk = particles[1][k];
+                        double ellk = particles[2][k];
+                        rho_snapshot[k] = calculate_rho(particles, k, g_mass_prefix_sum, npts);
+                        v_sq_snapshot[k] = vradk * vradk + ellk * ellk / (rk * rk);
+                    }
+#pragma omp parallel for default(shared) schedule(static)
                     for (int idx = 0; idx < npts; idx++)
                     {
                         int orig_id = (int)particles[3][idx];
@@ -14273,6 +14663,15 @@ cleanup_diag_iteration:
                         rebuild_mass_prefix_sum(particles, npts);
                     }
 #pragma omp barrier
+#pragma omp parallel for default(shared) schedule(static)
+                    for (int k = 0; k < npts; k++)
+                    {
+                        double rk = particles[0][k];
+                        double vradk = particles[1][k];
+                        double ellk = particles[2][k];
+                        rho_snapshot[k] = calculate_rho(particles, k, g_mass_prefix_sum, npts);
+                        v_sq_snapshot[k] = vradk * vradk + ellk * ellk / (rk * rk);
+                    }
 
 #pragma omp parallel for default(shared) schedule(static)
                     for (int idx = 0; idx < npts; idx++)
@@ -18790,11 +19189,10 @@ static void calculate_system_energies(double** particles, int npts, double delta
             KE_sum += ke_per_mass * m_i;
         }
 
-        // Potential Energy per unit mass for particle i.
         // The potential is due to the mass enclosed within its rank-ordered position.
         double M_enclosed = g_mass_prefix_sum[i] + particles[8][i]; // prefix sum up to and including i
 
-
+        // Potential Energy per unit mass for particle i.
         if (r > 1e-12) { // Avoid division by zero
             double pe_per_mass = -(G_CONST * VEL_CONV_SQ) * M_enclosed / r;
             PE_sum += pe_per_mass * m_i;
