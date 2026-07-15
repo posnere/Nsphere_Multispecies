@@ -1775,14 +1775,15 @@ static inline double calculate_rho(double** particles, int current_rank, double*
  */
 
 
-static inline void drag_force(double r, double v_rad, 
-                              int current_rank, 
-                              double ell, 
-                              double** particles,
-                              double* rho_snapshot, double* v_sq_snapshot,
-                              int npts, double G_value, 
-                              double *dvdt_drag, double *delldt_drag)
+static inline void drag_force(double r, double v_rad,
+    int current_rank,
+    double ell,
+    double** particles,
+    double* rho_snapshot, double* v_sq_snapshot,
+    int npts, double G_value,
+    double* dvdt_drag, double* delldt_drag)
 {
+    
     if (current_rank >= npts - RANK_BUFFER || current_rank < RANK_BUFFER)
     {
         *dvdt_drag = 0.0;
@@ -1795,6 +1796,13 @@ static inline void drag_force(double r, double v_rad,
         *delldt_drag = 0.0;
         return;
     }
+    if (particles[7][current_rank] == 0) // Drag force does not act on species 0 (CDM)
+    {
+        *dvdt_drag = 0.0;
+        *delldt_drag = 0.0;
+        return;
+    }
+
 
     double rho_enc = rho_snapshot[current_rank];
     double X_vel = 0.0;
@@ -1818,16 +1826,20 @@ static inline void drag_force(double r, double v_rad,
         return;
     }
 
-    X_vel = v/(sqrt(2*X_squared_mean / 3));
+    double sigma_local = sqrt(2 * X_squared_mean / 3);
+    X_vel = v * sigma_local;
 
     double ln_lambda = 12.9; // Set manually temporarily. approx ln(0.4*npts) for npts = 10^6.
-      
-    double v_inv = 1 / v;
+
+    double eps = 1e-3 * sigma_local;
+    double v_inv = v / (v * v + eps * eps); // regularization for good behavior at low velocities
+
     double dispersive_conponent = erf(X_vel) - (2 / sqrt(PI)) * X_vel * exp(-1 * X_vel * X_vel);
-    double drag_total = 4 * PI * G_value * G_value * particles[8][current_rank] * rho_enc * ln_lambda * v_inv * v_inv * dispersive_conponent; // See eq 8.3 in Binney & Tremaine
-    
+    double drag_total = 4 * PI * VEL_CONV_SQ * VEL_CONV_SQ * G_value * G_value * particles[8][current_rank] * rho_enc * ln_lambda * v_inv * v_inv * dispersive_conponent; // See eq 8.3 in Binney & Tremaine
+
     *dvdt_drag = -drag_total * v_rad * v_inv; // dv/dt due to the dynamic drag.
     *delldt_drag = -drag_total * ell * v_inv; // dell/dt due to the dynamic drag.
+
     
 }
 
@@ -3611,6 +3623,7 @@ static void doMicroLeapfrog(
     {
         // Drift: update position using current velocity
         r_curr += midStep * v_curr;
+        if (r_curr < 0.0) { r_curr = -r_curr; v_curr = -v_curr; }
 
         // Kick: update velocity using forces at new position
         drag_force(r_curr, v_curr, i, ell_curr, particles, rho_snapshot, v_sq_snapshot, npts, grav, &dvdt_drag, &dell_dt_drag);
@@ -3622,6 +3635,7 @@ static void doMicroLeapfrog(
 
     // Final full drift
     r_curr += midStep * v_curr;
+    if (r_curr < 0.0) { r_curr = -r_curr; v_curr = -v_curr; }
 
     // Final half-kick
     drag_force(r_curr, v_curr, i, ell_curr, particles, rho_snapshot, v_sq_snapshot, npts, grav, &dvdt_drag, &dell_dt_drag);
@@ -4594,7 +4608,7 @@ static void read_initial_conditions(double **particles, int npts, const char *fi
  */
 static void initialize_particle_masses(double** particles, int npts)
 {
-    int profile = 1; // temporary hard-coding. To be replaced by user-selected profiles. @@TBD@@
+    int profile = 2; // temporary hard-coding. To be replaced by user-selected profiles. @@TBD@@
 
     if (profile == 0) // Equal mass per particle
     {
@@ -4602,12 +4616,12 @@ static void initialize_particle_masses(double** particles, int npts)
         for (int i = 0; i < npts; i++)
             particles[8][i] = m;
     }
-    if (profile == 1) // Baryons of mass 1000 times greater than DM
+    else if (profile == 1) // Baryons of mass 1000 times greater than DM
     {
         int n_dm = 0;
         double m_dm;
         double m_bar;
-        double mass_ratio = 100; //ratio of masses m_bar/m_dm
+        double mass_ratio = 320; //ratio of masses m_bar/m_dm
         for (int i = 0; i < npts; i++)
             n_dm += particles[7][i];
         m_dm = g_active_halo_mass / (npts + (mass_ratio-1) * n_dm);
@@ -4619,6 +4633,31 @@ static void initialize_particle_masses(double** particles, int npts)
             else
                 particles[8][i] = m_dm;
         }
+    }
+    else if (profile == 2) // Mimicking scenario of Errani et al, 2026
+    {
+        int n_low = 360;
+        int n_high = 90;
+        double mass_low = 0.2;
+        double mass_high = 0.8;
+        double mass_dm = (g_halo_mass_param-(n_low* mass_low+ n_high* mass_high))/(npts-n_low-n_high);
+
+        for (int i = 0; i < npts; i++) {
+            if (i < n_low) {
+                particles[7][i] = 1;
+                particles[8][i] = mass_low;
+            }
+            else if (i < n_high+ n_low) {
+                particles[7][i] = 2;
+                particles[8][i] = mass_high;
+            }
+            else {
+                particles[7][i] = 0;
+                particles[8][i] = mass_dm;
+            }
+                
+        }
+
     }
 }
 // =============================================================================
@@ -7116,7 +7155,7 @@ printf("  \n");
 
     int npts = 100000;
     int Ntimes = 10000;
-    int tfinal_factor = 5;
+    double tfinal_factor = 5.0;
     int nout = 100;
     int dtwrite = 100;
     int snapshot_block_size = 100;  // Default value, can be overridden with --snapshot-buffer
@@ -7186,13 +7225,13 @@ printf("  \n");
         {
             if (i + 1 >= argc)
             {
-                errorAndExit("--tfinal requires an integer argument", NULL, argv[0]);
+                errorAndExit("--tfinal requires a numeric argument", NULL, argv[0]);
             }
-            if (!isInteger(argv[i + 1]))
+            if (!isFloat(argv[i + 1]))
             {
-                errorAndExit("invalid integer for --tfinal", argv[i + 1], argv[0]);
+                errorAndExit("invalid number for --tfinal", argv[i + 1], argv[0]);
             }
-            tfinal_factor = atoi(argv[++i]);
+            tfinal_factor = atof(argv[++i]);
         }
         else if (strcmp(argv[i], "--nout") == 0)
         {
@@ -7897,7 +7936,7 @@ printf("  \n");
     
     printf("  Number of Particles:          %d\n", npts);
     printf("  Number of Time Steps:         %d\n", Ntimes);
-    printf("  Number of Dynamical Times:    %d\n", tfinal_factor);
+    printf("  Number of Dynamical Times:    %g\n", tfinal_factor);
     printf("  Number of Output Snapshots:   %d\n", nout);
     printf("  Steps Between Writes:         %d\n", dtwrite);
     printf("  Snapshot Buffer Size:         %d\n", snapshot_block_size);
@@ -7978,7 +8017,7 @@ printf("  \n");
     if (g_enable_logging)
     {
         printf("  Logging:                      Enabled (log/nsphere.log)\n\n");
-        log_message("INFO", "Simulation started with %d particles, %d timesteps, %d dynamical times",
+        log_message("INFO", "Simulation started with %d particles, %d timesteps, %g dynamical times",
                     npts, Ntimes, tfinal_factor);
     }
     else
@@ -8110,9 +8149,9 @@ printf("  \n");
         // Add method/parameter tag
         char temp[256];
         if (include_method_in_suffix) {
-            snprintf(temp, sizeof(temp), "_%s_%d_%d_%d", method_str, npts, Ntimes, tfinal_factor);
+            snprintf(temp, sizeof(temp), "_%s_%d_%d_%g", method_str, npts, Ntimes, tfinal_factor);
         } else {
-            snprintf(temp, sizeof(temp), "_%d_%d_%d", npts, Ntimes, tfinal_factor);
+            snprintf(temp, sizeof(temp), "_%d_%d_%g", npts, Ntimes, tfinal_factor);
         }
         strncat(predicted_suffix, temp, sizeof(predicted_suffix) - strlen(predicted_suffix) - 1);
         
@@ -8174,11 +8213,11 @@ printf("  \n");
     char temp[256];
     if (include_method_in_suffix)
     {
-        snprintf(temp, sizeof(temp), "_%s_%d_%d_%d", method_str, npts, Ntimes, tfinal_factor);
+        snprintf(temp, sizeof(temp), "_%s_%d_%d_%g", method_str, npts, Ntimes, tfinal_factor);
     }
     else
     {
-        snprintf(temp, sizeof(temp), "_%d_%d_%d", npts, Ntimes, tfinal_factor);
+        snprintf(temp, sizeof(temp), "_%d_%d_%g", npts, Ntimes, tfinal_factor);
     }
 
     /** @brief Append the parameter tag to the global suffix. */
@@ -8252,7 +8291,7 @@ printf("  \n");
             return 1;
         }
 
-        fprintf(fp_params, "%d %d %d %s\n", npts, Ntimes, tfinal_factor, file_tag);
+        fprintf(fp_params, "%d %d %g %s\n", npts, Ntimes, tfinal_factor, file_tag);
         fclose(fp_params);
 
         /** @note Create a standard-named link `data/lastparams.dat` pointing to the
@@ -11522,10 +11561,10 @@ cleanup_diag_iteration:
         characteristic_radius_for_tdyn = g_cored_profile_rc; // Set from g_scale_radius_param
     }
     double tdyn = 1.0 / sqrt((VEL_CONV_SQ * G_CONST) * g_active_halo_mass / cube(characteristic_radius_for_tdyn));
-    double totaltime = (double)tfinal_factor * tdyn; ///< Total simulation time (Myr)
+    double totaltime = tfinal_factor * tdyn; ///< Total simulation time (Myr)
     double dt = totaltime / ((double)(Ntimes - 1));  ///< Individual timestep size (Myr)
     printf("Dynamical time tdyn = %.4f Myr\n", tdyn);
-    printf("Total simulation time = %.4f Myr (%.1f tdyn)\n", totaltime, (double)tfinal_factor);
+    printf("Total simulation time = %.4f Myr (%.1f tdyn)\n", totaltime, tfinal_factor);
     printf("Timestep dt = %.6f Myr\n\n", dt);
 
     // Calculate minimum critical radius for Levi-Civita switching
@@ -12199,7 +12238,7 @@ cleanup_diag_iteration:
             printf("  Source N:         %d (from filename)\n", src_N);
             printf("\nTarget extension parameters:\n");
             printf("  Target Ntimes:    %d\n", Ntimes);
-            printf("  Target tfinal:    %d\n", tfinal_factor);
+            printf("  Target tfinal:    %g\n", tfinal_factor);
             printf("  Target dtwrite:   %d\n", dtwrite);
             printf("  Target N:         %d\n", npts);
             printf("\n");
@@ -12308,7 +12347,7 @@ cleanup_diag_iteration:
                         src_N, src_Ntimes, (int)src_tfinal);
                 fprintf(stderr, "       Source file has %lld snapshots, implying dtwrite=%d\n",
                         source_snapshots, src_dtwrite);
-                fprintf(stderr, "       Current parameters are: N=%d, Ntimes=%d, tfinal=%d, dtwrite=%d\n", 
+                fprintf(stderr, "       Current parameters are: N=%d, Ntimes=%d, tfinal=%g, dtwrite=%d\n", 
                         npts, Ntimes, tfinal_factor, dtwrite);
                 fprintf(stderr, "\n");
                 fprintf(stderr, "       To extend this file correctly, use:\n");
@@ -12320,17 +12359,20 @@ cleanup_diag_iteration:
             
             printf("  Validated:        dtwrite matches (%d timesteps between writes)\n", src_dtwrite);
 
-            // Validate physical timestep (dt) matches exactly using integer arithmetic
-            // dt = tfinal × tdyn / (Ntimes - 1) must be identical
-            // Cross multiply to avoid floating point: tfinal_src × (Ntimes_tgt - 1) = tfinal_tgt × (Ntimes_src - 1)
-            long long lhs_product = (long long)src_tfinal * (long long)(Ntimes - 1);
-            long long rhs_product = (long long)tfinal_factor * (long long)(src_Ntimes - 1);
+            // Validate physical timestep (dt) matches between source and target.
+            // dt = tfinal * tdyn / (Ntimes - 1) must be identical.
+            // tfinal can now be fractional, so exact integer cross-multiplication no
+            // longer applies -- compare the cross products in double precision with
+            // a small relative tolerance instead.
+            double lhs_product = src_tfinal * (double)(Ntimes - 1);
+            double rhs_product = tfinal_factor * (double)(src_Ntimes - 1);
+            double tol = 1e-6 * fmax(fabs(lhs_product), fabs(rhs_product)); // Tolerance for discrepencies in timestamps
 
-            if (lhs_product != rhs_product) {
+            if (fabs(lhs_product - rhs_product) > tol) {
                 fprintf(stderr, "\nERROR: Physical timestep (dt) does not match between source and target.\n");
-                fprintf(stderr, "       Source: tfinal=%d, Ntimes=%d\n", (int)src_tfinal, src_Ntimes);
-                fprintf(stderr, "       Target: tfinal=%d, Ntimes=%d\n", tfinal_factor, Ntimes);
-                fprintf(stderr, "       dt must match exactly for extension (tfinal/Ntimes ratio must be identical).\n");
+                fprintf(stderr, "       Source: tfinal=%g, Ntimes=%d\n", src_tfinal, src_Ntimes);
+                fprintf(stderr, "       Target: tfinal=%g, Ntimes=%d\n", tfinal_factor, Ntimes);
+                fprintf(stderr, "       dt must match (within tolerance) for extension (tfinal/Ntimes ratio must be identical).\n");
                 exit(1);
             }
 
@@ -13397,13 +13439,13 @@ cleanup_diag_iteration:
         }
 
         // Frozen per-step snapshots for drag_force's neighbor sampling
-        double* rho_snapshot = (double*)malloc(npts * sizeof(double));
+        rho_snapshot = (double*)malloc(npts * sizeof(double));
         if (!rho_snapshot) {
             fprintf(stderr, "ERROR: Failed to allocate radius snapshot for dynamic drag calculation\n");
             CLEAN_EXIT(1);
         }
 
-        double* v_sq_snapshot = (double*)malloc(npts * sizeof(double));
+        v_sq_snapshot = (double*)malloc(npts * sizeof(double));
         if (!v_sq_snapshot) {
             fprintf(stderr, "ERROR: Failed to allocate velocity squared snapshot dor dynamic drag calculation\n");
             CLEAN_EXIT(1);
