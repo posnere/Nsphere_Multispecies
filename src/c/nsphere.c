@@ -1708,7 +1708,7 @@ static inline double gravitational_force(double r, int current_rank, int npts, d
     }
     else
     {
-        double r_sq_inv = 1.0 / (r * r);
+        double r_sq_inv = 1.0 / (r * r + 1e-7); // added softening
         double M_enc = g_mass_prefix_sum[current_rank]; // sum of masses for all particles interior to this one
         return -(VEL_CONV_SQ * G_CONST) * M_enc * r_sq_inv;
     }
@@ -1727,7 +1727,7 @@ static inline double effective_angular_force(double r, double ell)
 }
 
 /**
- * @brief Computes the local density around a certain point.
+ * @brief Computes the local density of CDM around a certain point.
  *
  * @param particles           [in] Particle data array (rows: position...).
  * @param current_rank        [in] Particle rank (0 to npts-1), used to index `particles`.
@@ -1738,21 +1738,30 @@ static inline double calculate_rho(double** particles, int current_rank, double*
 {
     double delta_M = 0.0;
     double r_max, r_min;
+    int index_max, index_min;
     
     if (current_rank < RANK_BUFFER) {
-        delta_M = g_mass_prefix_sum[current_rank + RANK_BUFFER];
-        r_max = particles[0][current_rank + RANK_BUFFER];
-        r_min = 0.0;
+        //delta_M = g_mass_prefix_sum[current_rank + RANK_BUFFER];
+        index_max = current_rank + RANK_BUFFER;
+        index_min = 0;
     }
     else if (current_rank >= npts - RANK_BUFFER) {
-        delta_M = g_halo_mass_param - g_mass_prefix_sum[current_rank - RANK_BUFFER];
-        r_max = particles[0][npts-1];
-        r_min = particles[0][current_rank - RANK_BUFFER];
+        //delta_M = g_halo_mass_param - g_mass_prefix_sum[current_rank - RANK_BUFFER];
+        index_max = npts - 1;
+        index_min = current_rank - RANK_BUFFER;
     }
     else {
-        delta_M = g_mass_prefix_sum[current_rank + RANK_BUFFER] - g_mass_prefix_sum[current_rank - RANK_BUFFER];
-        r_max = particles[0][current_rank + RANK_BUFFER];
-        r_min = particles[0][current_rank - RANK_BUFFER];
+        //delta_M = g_mass_prefix_sum[current_rank + RANK_BUFFER] - g_mass_prefix_sum[current_rank - RANK_BUFFER];
+        index_max = current_rank + RANK_BUFFER;
+        index_min = current_rank - RANK_BUFFER;
+    }
+
+    r_max = particles[0][index_max];
+    r_min = particles[0][index_min];
+
+    for (int i = index_min; i <= index_max; i++) {
+        if (particles[7][i] == 0)
+            delta_M += particles[8][i];
     }
 
     return delta_M / ((4 * PI / 3) * (r_max * r_max * r_max - r_min * r_min * r_min));
@@ -1824,9 +1833,9 @@ static inline void drag_force(double r, double v_rad,
     int i_fin = RANK_BUFFER;
     if (current_rank >= npts - RANK_BUFFER) i_fin = 0;  // Outer particles
     
-    for (int i = i_ini; i <= i_fin; i++)
-    {
-        X_squared_mean += v_sq_snapshot[current_rank + i];
+    for (int i = i_ini; i <= i_fin; i++){
+        if (particles[7][current_rank + i] == 0)
+            X_squared_mean += v_sq_snapshot[current_rank + i];
     }
 
     X_squared_mean = X_squared_mean / (i_fin - i_ini + 1);
