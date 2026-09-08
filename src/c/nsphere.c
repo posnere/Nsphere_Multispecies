@@ -707,6 +707,24 @@ int debug_direct_convolution = 0;
 #define kmsec_to_kpcmyr 1.02271e-3 ///< Conversion factor: km/s to kpc/Myr.
 #define VEL_CONV_SQ (kmsec_to_kpcmyr * kmsec_to_kpcmyr) ///< Velocity conversion squared (kpc/Myr)\f$^2\f$ per (km/s)\f$^2\f$.
 
+/**
+ * @brief Plummer-equivalent gravitational softening length [kpc] (~0.1 pc).
+ * @details Sized to the mean dark-matter inter-particle spacing \f$r_{mx}N_{mx}^{-1/3}\f$
+ *          for the Errani et al. (arXiv:2604.06304) Upsilon_dyn0=10 setup this code targets,
+ *          matching their own choice of \f$\epsilon_{DM}=0.1\f$ pc (Sec. 2.3) -- chosen there,
+ *          and here, to suppress spurious discreteness-driven heating below the scale the
+ *          particle sampling can actually resolve, while leaving the physical dynamical
+ *          friction signal (operating on much larger scales) unaffected.
+ *
+ *          Applied to the enclosed-mass force law \f$F(r)=-GM_{enc}(r)/r^2\f$ (the only force
+ *          this code computes; there are no pairwise particle-particle forces to soften
+ *          individually, unlike a tree/direct-summation N-body code), giving the Plummer form
+ *          \f$F(r)=-GM_{enc}(r)\,r/(r^2+\epsilon^2)^{3/2}\f$. See @ref gravitational_force and
+ *          @ref gravitational_force_rho_v.
+ */
+#define GRAV_SOFTENING_LENGTH 1.0e-4 ///< [kpc]
+#define GRAV_SOFTENING_SQ (GRAV_SOFTENING_LENGTH * GRAV_SOFTENING_LENGTH) ///< \f$\epsilon^2\f$ [kpc\f$^2\f$], precomputed.
+
 // Mathematical utility macros
 #define sqr(x) ((x) * (x))       ///< Calculates the square of a value: \f$x^2\f$.
 #define cube(x) ((x) * (x) * (x)) ///< Calculates the cube of a value: \f$x^3\f$.
@@ -1708,9 +1726,16 @@ static inline double gravitational_force(double r, int current_rank, int npts, d
     }
     else
     {
-        double r_sq_inv = 1.0 / (r * r + 1e-7); // added softening
+        // Plummer-equivalent softening: F(r) = -G*M_enc(r)*r / (r^2 + eps^2)^1.5, reducing to the
+        // bare -G*M_enc/r^2 for r >> eps. See GRAV_SOFTENING_LENGTH for the derivation of eps.
+        // NOTE: x^1.5 computed as x*sqrt(x) rather than pow(x, 1.5) -- this is called from every
+        // force evaluation in every integration method (billions of times per run), and pow()
+        // with a non-integer exponent is a general exp(1.5*log(x)) evaluation, far more expensive
+        // than the single hardware sqrt() this is mathematically identical to.
+        double base = r * r + GRAV_SOFTENING_SQ;
+        double denom = base * sqrt(base);
         double M_enc = g_mass_prefix_sum[current_rank]; // sum of masses for all particles interior to this one
-        return -(VEL_CONV_SQ * G_CONST) * M_enc * r_sq_inv;
+        return -(VEL_CONV_SQ * G_CONST) * M_enc * r / denom;
     }
 }
 
@@ -1901,9 +1926,24 @@ static inline double gravitational_force_rho_v(double rho, int current_rank, int
     }
     else
     {
-        double rho_sq_inv = 1.0 / (rho * rho);
+        // Same Plummer-equivalent softening as gravitational_force(), transformed into rho
+        // coordinates. Physically, r = rho^2, so the softened physical-space acceleration
+        // a(r) = G*M_enc*r/(r^2+eps^2)^1.5 becomes, in terms of rho:
+        //   a(r) = G*M_enc*rho^2 / (rho^4 + eps^2)^1.5
+        // and since dv/dtau = a(r)*rho^2 (the standard Levi-Civita time-transform relation
+        // used throughout this regularization scheme), this gives:
+        //   dv/dtau = G*M_enc*rho^4 / (rho^4 + eps^2)^1.5
+        // which correctly reduces to the bare -G*M_enc/rho^2 far from the origin (rho^4 >> eps^2)
+        // while staying finite (-> 0) as rho -> 0, removing the coordinate-singular force this
+        // regularization was already built to handle numerically, but now also physically.
+        // x^1.5 computed as x*sqrt(x) rather than pow(x, 1.5) -- see gravitational_force() for
+        // why; this function is called even more frequently (every LC micro-step), so the cost
+        // of a general pow() here matters even more.
+        double rho4 = rho * rho * rho * rho;
+        double base = rho4 + GRAV_SOFTENING_SQ;
+        double denom = base * sqrt(base);
         double M_enc = g_mass_prefix_sum[current_rank]; // sum of masses for all particles interior to this one
-        return -(VEL_CONV_SQ * G_CONST) * M_enc * rho_sq_inv;
+        return -(VEL_CONV_SQ * G_CONST) * M_enc * rho4 / denom;
     }
 }
 
@@ -2495,7 +2535,7 @@ static void printUsage(const char *prog)
             "  --init-cond-seed <int>        [Default Random/Master] Set seed for IC generation.\n"
             "                                     Overrides derivation from master-seed.\n"
             "\n"
-            "  --method <int>                [Default 1] Integration method (1..9):\n"
+            "  --method <int>                [Default 1] Integration method (1..10):\n"
             "                                          1   Adaptive Leapfrog with Adaptive Levi-Civita\n"
             "                                          2   Full-step adaptive Leapfrog + Levi-Civita\n"
             "                                          3   Full-step adaptive Leapfrog\n"
@@ -2505,6 +2545,7 @@ static void printUsage(const char *prog)
             "                                          7   Leapfrog (pos half-step)\n"
             "                                          8   Classic RK4\n"
             "                                          9   Euler\n"
+            "                                         10   Hierarchical Block Individual Time-Stepping\n"
             "  --methodtag                   [Default Off] Include method string in output filenames\n"
             "  --sort <int>                  [Default 1] Sorting algorithm (1..6):\n"
             "                                          1   Parallel Quadsort\n"
@@ -4684,7 +4725,7 @@ static void read_initial_conditions(double **particles, int npts, const char *fi
  */
 static void initialize_particle_masses(double** particles, int npts)
 {
-    int profile = 2; // temporary hard-coding. To be replaced by user-selected profiles. @@TBD@@
+    int profile = 0; // temporary hard-coding. To be replaced by user-selected profiles. @@TBD@@
 
     if (profile == 0) // Equal mass per particle
     {
@@ -7465,10 +7506,10 @@ printf("  \n");
             }
             method_select = atoi(argv[++i]);
 
-            if (method_select < 1 || method_select > 9)
+            if (method_select < 1 || method_select > 10)
             {
                 char buf[256];
-                snprintf(buf, sizeof(buf), "method must be in [1..9]");
+                snprintf(buf, sizeof(buf), "method must be in [1..10]");
                 errorAndExit(buf, NULL, argv[0]);
             }
         }
@@ -7924,6 +7965,10 @@ printf("  \n");
     case 9:
         method_select = 0;
         method_verbose_name = "Euler";
+        break;
+    case 10:
+        method_select = 9;
+        method_verbose_name = "Hierarchical Block Individual Time-Stepping";
         break;
     default:
         method_verbose_name = "Unknown Method";
@@ -14079,7 +14124,7 @@ cleanup_diag_iteration:
                  * @details Dynamically selects between standard leapfrog and Levi-Civita
                  *          regularization based on particle's radius and angular momentum.
                  */
-#pragma omp parallel for default(shared) schedule(static)
+#pragma omp parallel for default(shared) schedule(dynamic)
                 for (i = 0; i < npts; i++)
                 {
                     double r = particles[0][i];
@@ -14970,6 +15015,301 @@ cleanup_diag_iteration:
                         }
                     }
                 } // End of the "else" block for normal AB3.
+            }
+            /**
+             * @brief Method 10: Hierarchical Block Individual Time-Stepping.
+             * @details Methods 1-9 all advance every particle using variants of a single
+             *          shared global timestep `dt`, so any orbit whose local dynamical time is
+             *          much shorter than `dt` (generic for low angular-momentum particles in a
+             *          cuspy potential) forces the *whole* per-particle integrator into expensive
+             *          adaptive refinement, even though most particles never approach such
+             *          conditions.
+             *
+             *          This method instead gives each particle its own number of equal
+             *          sub-steps `N = 2^level` for covering the current `dt`, chosen once per
+             *          macro-step from a standard acceleration ("free-fall time") individual
+             *          timestep criterion in the spirit of Aarseth-style N-body block
+             *          time-stepping (Aarseth, "Gravitational N-Body Simulations", 2003, Ch. 2),
+             *          rounded down to the nearest power-of-two subdivision
+             *          `dt / 2^level` with `level` in `[0, KMAX_BLOCK_LEVEL]`. A particle whose
+             *          orbit is intrinsically at risk of a close encounter this block -- flagged
+             *          via the same `r_crit` / `r_crit_min` / low-`ell` criterion already used by
+             *          methods 4 and 5 -- bypasses the block hierarchy entirely and is instead
+             *          handed to the existing, already-validated Levi-Civita regularized
+             *          integrator `doLeviCivitaLeapfrog`, exactly as method 4 already does for
+             *          its close-encounter branch.
+             *
+             *          As with every other method in this file, `g_mass_prefix_sum` (and hence
+             *          each particle's enclosed mass `M_enc`) is a snapshot frozen for the
+             *          duration of the macro-step `dt`: it is rebuilt once, from a single
+             *          `sort_particles`/`rebuild_mass_prefix_sum` call, before any particle is
+             *          advanced. This is not a new approximation introduced by this method --
+             *          every other method makes the same assumption internally, no matter how
+             *          many adaptive/regularized sub-steps a given particle takes within one
+             *          `dt`. Reusing this convention (rather than re-sorting mid-step) is what
+             *          keeps the per-particle sub-stepping below embarrassingly parallel: each
+             *          particle's own sequence of sub-steps only ever reads the frozen
+             *          `g_mass_prefix_sum`/`rho_snapshot`/`v_sq_snapshot` arrays and writes only
+             *          its own row of `particles`, so no cross-particle synchronization is needed
+             *          until the next macro-step's sort.
+             *
+             * @note `KMAX_BLOCK_LEVEL` bounds the finest block-tier resolution to `dt / 2^24`.
+             *       Particles whose local dynamics would require finer resolution than this are
+             *       expected to already be routed to the Levi-Civita branch via
+             *       `r_crit`/`r_crit_min`; the clamp is a safety bound, not a normal operating
+             *       point.
+             */
+            else if (method_select == 9)
+            {
+                double alpha_param = 0.05;        // Same r_crit formula as methods 4 & 5.
+                int N_taumin_LC = 10;              // Initial fictitious-time-step guess for the
+                                                    // adaptive LC integrator below (same value
+                                                    // used by method 5) -- refined via coarse/fine
+                                                    // doubling, not the final resolution.
+                double radius_tol_LC = 1.0e-5;     // Same tolerances as method 5's LC branch.
+                double velocity_tol_LC = 1.0e-3;
+                int max_subdiv_LC = 4096 * 4096;
+                int out_type_LC = 2;               // Richardson extrapolation.
+                const double eta_timestep = 0.01;  // Individual-timestep accuracy parameter for
+                                                    // the acceleration criterion (standard choice;
+                                                    // see e.g. Aarseth 2003, GADGET-2 docs).
+                const int KMAX_BLOCK_LEVEL = 24;   // Finest block-tier subdivision: dt / 2^24.
+
+#pragma omp single
+                {
+                    sort_particles(particles, npts);
+                    rebuild_mass_prefix_sum(particles, npts);
+                }
+#pragma omp barrier
+#pragma omp parallel for default(shared) schedule(static)
+                for (int k = 0; k < npts; k++)
+                {
+                    double rk = particles[0][k];
+                    double vradk = particles[1][k];
+                    double ellk = particles[2][k];
+                    rho_snapshot[k] = calculate_rho(particles, k, g_mass_prefix_sum, npts);
+                    v_sq_snapshot[k] = vradk * vradk + ellk * ellk / (rk * rk);
+                }
+
+#pragma omp parallel for default(shared) schedule(static)
+                for (int idx = 0; idx < npts; idx++)
+                {
+                    int orig_id = (int)particles[3][idx];
+                    inverse_map[orig_id] = idx;
+                }
+
+                // SIDM scattering before gravity (uses radius-sorted neighbor list)
+                double current_active_rc_for_sidm = g_use_hernquist_aniso_profile ? g_scale_radius_param : (g_use_nfw_profile ? g_nfw_profile_rc : g_cored_profile_rc);
+                handle_sidm_step(particles, npts, dt, time, current_active_rc_for_sidm, display_method, 0, g_current_timestep_scatter_counts, rng_timestep);
+
+                /**
+                 * @brief Per-particle classification and integration.
+                 * @details Embarrassingly parallel: each iteration only reads the frozen
+                 *          snapshots built above and writes only `particles[0..2][i]`, so no
+                 *          synchronization is needed within this loop. `schedule(dynamic)` is
+                 *          used because per-particle cost is highly non-uniform (close-encounter
+                 *          and fine-level particles cost far more than the bulk population),
+                 *          matching the scheduling already used by method 5's equivalent loop.
+                 */
+                // TEMPORARY DIAGNOSTIC: tally how the population splits between the LC branch
+                // and the block-tier branch, and what sub-step levels the block-tier particles
+                // actually get assigned, to find out where time is really going. Remove once the
+                // performance question is resolved.
+                long diag_count_LC = 0, diag_count_block = 0;
+                long long diag_sum_level = 0;
+                int diag_max_level = 0;
+
+#pragma omp parallel for default(shared) schedule(dynamic) reduction(+:diag_count_LC,diag_count_block,diag_sum_level) reduction(max:diag_max_level)
+                for (int i = 0; i < npts; i++)
+                {
+                    double r = particles[0][i];
+                    double v = particles[1][i];
+                    double ell = particles[2][i];
+
+                    // Calculate r_crit, using special handling for particle i=0 (M_enc=0) to
+                    // avoid division by zero. Identical formula to methods 4 and 5, reused here
+                    // to flag orbits whose intrinsic pericenter (not just their current radius)
+                    // is small enough to warrant Levi-Civita regularization for the whole
+                    // macro-step.
+                    double M_enc;
+                    if (i == 0)
+                    {
+                        // Special handling for i=0 to avoid zero mass in denominator
+                        M_enc = fmax(particles[8][0] * 0.1, 1e-30);
+                    }
+                    else
+                    {
+                        M_enc = g_mass_prefix_sum[i];
+                    }
+                    double r_crit = 0.0;
+                    if (fabs(ell) > 1.0e-30)
+                    {
+                        double gravPart = (VEL_CONV_SQ * G_CONST) * M_enc;
+                        r_crit = (ell * ell) * alpha_param / gravPart;
+                    }
+
+                    // NOTE: unlike methods 4/5, this check must NOT depend on the particle's
+                    // *current* radius. Method 10 assigns each non-LC particle its block-tier
+                    // sub-step count once, from its state at the top of this macro-step, with no
+                    // adaptive fallback if that estimate turns out to be wrong mid-step (that's
+                    // what makes it fast). A particle sitting near apocenter on an intrinsically
+                    // small-pericenter orbit must therefore be flagged from r_crit itself (an
+                    // orbit property, via ell and M_enc) rather than from "is r currently small",
+                    // otherwise it can plunge to a near-singular radius later in this same step
+                    // while still assigned a single coarse block-tier sub-step, and blow up.
+                    //
+                    // NOTE: methods 4/5 also OR in `fabs(ell) < 1.0e-3` here as an extra safety
+                    // net. That is an *absolute* angular-momentum threshold, and at this halo's
+                    // scale it is not a safety net at all: a typical particle's ell here is of
+                    // order r*v_circ ~ 5e-6 (kpc^2/Myr), roughly 200x smaller than 1.0e-3 -- so
+                    // essentially every particle in the population satisfies it trivially,
+                    // regardless of its actual orbit. Diagnostics confirmed this routed 100% of
+                    // particles into the expensive LC branch every step, silently disabling the
+                    // entire block-tier design. It is deliberately omitted here: r_crit already
+                    // handles the near-radial case correctly and at the right scale (r_crit = 0.0
+                    // whenever `ell` is too small to compute it above, and 0.0 < r_crit_min is
+                    // always true, so a genuinely near-radial orbit is still caught via the
+                    // r_crit clause alone).
+                    int use_LC = ((r_crit < r_crit_min) || (r < r_crit_min));
+
+                    double r_new, v_new, ell_new;
+                    if (use_LC)
+                    {
+                        // Close-encounter orbit: reuse the existing, already-validated *adaptive*
+                        // Levi-Civita integrator over the full macro-step -- the same function
+                        // and parameters method 5 (the default --method 1) uses for its LC
+                        // branch.
+                        //
+                        // NOTE: this branch previously called the non-adaptive
+                        // doLeviCivitaLeapfrog instead, on the reasoning that Plummer softening
+                        // (GRAV_SOFTENING_LENGTH) bounds the force, so a fixed, unverified
+                        // fictitious-time resolution could no longer diverge. That reasoning was
+                        // wrong: bounded is not the same as small. The softened force still peaks
+                        // near ~G*M_enc/eps^2, which is large precisely because eps is tiny, and a
+                        // fixed ~20-step (N_taumin=10) integration can still badly misresolve a
+                        // particle passing through that peak, producing a huge (if finite, not
+                        // divergent) spurious kick -- confirmed empirically: KE jumped by ~4
+                        // orders of magnitude and then again by ~10 orders of magnitude in
+                        // testing with the non-adaptive integrator, even with softening active.
+                        // Now that the fabs(ell)<1e-3 routing bug (see NOTE above) is fixed and
+                        // only a modest fraction of particles are flagged use_LC, paying the
+                        // adaptive integrator's cost for that reduced subset is affordable again.
+                        doAdaptiveFullLeviCivita(
+                            i, npts, r, v, ell, dt, N_taumin_LC,
+                            radius_tol_LC, velocity_tol_LC, max_subdiv_LC,
+                            G_CONST, out_type_LC,
+                            particles, rho_snapshot, v_sq_snapshot,
+                            &r_new, &v_new, &ell_new);
+                        diag_count_LC++;
+                    }
+                    else
+                    {
+                        // Standard orbit: assign this particle its own number of equal leapfrog
+                        // sub-steps N = 2^level for covering the full macro-step dt, from a
+                        // standard acceleration ("free-fall time") criterion, then integrate
+                        // with the existing fixed-substep leapfrog kernel.
+                        // NOTE: deliberately uses the *gravitational* acceleration alone, not the
+                        // net (gravity + centrifugal) radial acceleration. The centrifugal term
+                        // is a fictitious artifact of reducing 3D orbital motion to a 1D radial
+                        // coordinate, and gravity + centrifugal genuinely cancels near a
+                        // particle's instantaneous circular-orbit radius -- a point at which the
+                        // particle is still sweeping through its orbit at full speed, not slow or
+                        // safe. Sizing the timestep off the net force let it read near-zero right
+                        // at such points, silently assigning a single coarse step (`level = 0`)
+                        // to particles that still needed fine resolution, which is what produced
+                        // the escalating, cascading energy-conservation failures seen in testing.
+                        // The true gravitational acceleration alone is always well-behaved (it
+                        // only vanishes at r -> infinity) and gives a proper free-fall-time
+                        // estimate independent of this cancellation.
+                        double force = gravitational_force(r, i, npts, G_CONST, g_active_halo_mass);
+                        double accel = fabs(force);
+
+                        // Secondary "crossing time" criterion: r / v_total. Guards against fast
+                        // angular sweep (large ell) at a radius where gravity itself happens to
+                        // be modest -- a case the free-fall criterion above alone would not catch,
+                        // since it only looks at the gravitational acceleration, not how fast the
+                        // particle is actually moving through its orbit.
+                        double v_total = sqrt(v * v + (ell * ell) / (r * r));
+
+                        int level = 0;
+                        if ((accel > 0.0 || v_total > 0.0) && r > 0.0)
+                        {
+                            double dt_accel = (accel > 0.0) ? eta_timestep * sqrt(r / accel) : dt;
+                            double dt_cross = (v_total > 0.0) ? eta_timestep * (r / v_total) : dt;
+                            double dt_local = fmin(dt_accel, dt_cross);
+                            if (dt_local > 0.0 && dt_local < dt)
+                            {
+                                level = (int)ceil(log2(dt / dt_local));
+                                if (level < 0) level = 0;
+                                if (level > KMAX_BLOCK_LEVEL) level = KMAX_BLOCK_LEVEL;
+                            }
+                        }
+
+                        int N_sub = 1 << level; // 2^level equal sub-steps spanning dt.
+                        doMicroLeapfrog(
+                            i, npts, r, v, ell, dt, N_sub, (2 * N_sub + 1),
+                            G_CONST, particles, rho_snapshot, v_sq_snapshot,
+                            &r_new, &v_new, &ell_new);
+                        diag_count_block++;
+                        diag_sum_level += level;
+                        if (level > diag_max_level) diag_max_level = level;
+                    }
+
+                    particles[0][i] = r_new;
+                    particles[1][i] = v_new;
+                    particles[2][i] = ell_new;
+                }
+
+                // TEMPORARY DIAGNOSTIC: print the branch split every 200 macro-steps (~50 prints
+                // over a 10000-step run) so it's cheap but still shows whether/how the split
+                // shifts over the course of the run.
+                if (j % 200 == 0)
+                {
+                    double avg_level = (diag_count_block > 0) ? ((double)diag_sum_level / (double)diag_count_block) : 0.0;
+                    printf("[method10 diag] j=%d  LC=%ld (%.4f%%)  block=%ld  avg_level=%.2f (avg N_sub=%.1f)  max_level=%d (max N_sub=%d)\n",
+                           j, diag_count_LC, 100.0 * (double)diag_count_LC / (double)npts,
+                           diag_count_block, avg_level, pow(2.0, avg_level),
+                           diag_max_level, 1 << diag_max_level);
+                }
+
+                // Record trajectory data at every timestep into buffer
+#pragma omp single
+                    {
+                        // Store time for this step and advance buffer index
+                        if (g_trajectory_buffer_index < g_trajectory_buffer_size) {
+                            g_time_buf[g_trajectory_buffer_index] = time;
+                        }
+                        g_trajectory_buffer_index++;
+                    }
+#pragma omp parallel for if (upper_npts_num_traj > 1000) schedule(static)
+                    for (int p = 0; p < upper_npts_num_traj; p++)
+                    {
+                        int idx = inverse_map[p];
+                        double rr = particles[0][idx];
+                        double vr = particles[1][idx];
+                        double ell = particles[2][idx];
+
+                        double Psi_val = evaluatespline(splinePsi, Psiinterp, rr);
+                        Psi_val *= VEL_CONV_SQ;
+
+                        double vtot = sqrt(vr * vr + (ell * ell) / (rr * rr));
+                        double mu_val = vr / vtot;
+                        double E_rel = Psi_val - 0.5 * (vr * vr + (ell * ell) / (rr * rr));
+
+                        if (g_trajectory_buffer_index - 1 < g_trajectory_buffer_size) {
+                            g_trajectories_buf[p][g_trajectory_buffer_index - 1] = rr;
+                            g_velocities_buf[p][g_trajectory_buffer_index - 1] = vr;
+                            g_mu_buf[p][g_trajectory_buffer_index - 1] = mu_val;
+                            g_E_buf[p][g_trajectory_buffer_index - 1] = E_rel;
+                            g_L_buf[p][g_trajectory_buffer_index - 1] = ell;
+                        }
+                    }
+
+#pragma omp single
+                {
+                    current_step = j + 1;
+                    time += dt;
+                }
             }
 
             // TODO: redistribute energy lost to friciton between the CDM particles
@@ -19418,8 +19758,13 @@ static void calculate_system_energies(double** particles, int npts, double delta
             KE_sum += ke_per_mass * m_i;
         }
 
-        // The potential is due to the mass enclosed within its rank-ordered position.
-        double M_enclosed = g_mass_prefix_sum[i] + particles[8][i]; // prefix sum up to and including i
+        // The potential is due to the mass strictly interior to this particle's rank-ordered
+        // position -- g_mass_prefix_sum[i] alone (excluding the particle's own mass), matching
+        // the convention gravitational_force() uses for the actual dynamics. Including the
+        // particle's own mass here (as a prior version of this diagnostic did) double-counts a
+        // spurious self-energy term per particle, biasing PE_sum systematically more negative
+        // than what the simulated forces actually correspond to.
+        double M_enclosed = g_mass_prefix_sum[i];
 
         // Potential Energy per unit mass for particle i.
         if (r > 1e-12) { // Avoid division by zero
