@@ -163,14 +163,23 @@ typedef double (*drhodr_nfw_func_t)(double r, double rc, double nt_nfw, double f
 // SIDM vector mathematics and cross-section function declarations
 threevector make_threevector(double x, double y, double z);
 double dotproduct(threevector X, threevector Y);
+double sigmatotal(double vrel, double **particles, int partner_idx, double rc_for_calc);
 threevector crossproduct(threevector X, threevector Y);
-double sigmatotal(double vrel, int npts, double halo_mass_for_calc, double rc_for_calc);
 
 // Serial SIDM scattering integration function declaration
-void perform_sidm_scattering_serial(double **particles, int npts, double dt, int timestep_idx, uint64_t sidm_seed, long long *Nscatter_total_step, double halo_mass_for_sidm, double rc_for_sidm, int *current_scatter_counts);
+void perform_sidm_scattering_serial(double **particles, int npts, double dt, int timestep_idx, uint64_t sidm_seed, long long *Nscatter_total_step, double rc_for_sidm, int *current_scatter_counts);
 
 // Forward declaration for the parallel SIDM scattering function (graph coloring algorithm)
-void perform_sidm_scattering_parallel_graphcolor(double **particles, int npts, double dt, int timestep_idx, uint64_t sidm_seed, long long *Nscatter_total_step, double halo_mass_for_sidm, double rc_for_sidm, int *current_scatter_counts);
+void perform_sidm_scattering_parallel_graphcolor(double **particles, int npts, double dt, int timestep_idx, uint64_t sidm_seed, long long *Nscatter_total_step, double rc_for_sidm, int *current_scatter_counts);
+
+// Star-dark-matter Rutherford scattering (--star-dm-rutherford), defined with the SIDM routines
+static void perform_star_dm_rutherford(double **particles, int npts, double dt, int timestep_idx, uint64_t seed, double *s_sum_out, double *dE_out);
+// Star-star Rutherford scattering (--star-star-rutherford), defined with the SIDM routines
+static void perform_star_star_rutherford(double **particles, int npts, double dt, int timestep_idx, uint64_t seed);
+// Exact-deflection table of the softened Rutherford cross-section (--star-softening, --star-dm-softening, --drag-softening)
+static void build_soft_sigma_table(void);
+// Softened Rutherford momentum-transfer cross-section (kpc^2); --drag-softening uses it for drag's ln Lambda
+static double rutherford_sigma_T(double b90, double b_max, double h);
 
 // Forward declarations for trajectory buffer management functions
 static void allocate_trajectory_buffers(int num_traj_particles, int nlowest, int buffer_size, int npts);
@@ -183,6 +192,7 @@ static void add_snapshot_to_double_buffer(double **particles, double *phi_array,
 static void flush_double_buffer_to_disk(const char *tag);
 static int load_from_double_buffer(const char *tag, int snapshot_index, int total_snapshots, double **particles, int npts, int *particle_ids);
 static void load_particles_from_restart(const char *filename, int snapshot_index, double **particles, int npts, int block_size, int *inverse_map);
+static void load_species_mass_or_default(const char *filename, int npts, double default_mass, int *species_by_id, double *mass_by_id);
 
 
 static char g_file_suffix[256] = ""; ///< Global file suffix string.
@@ -206,8 +216,8 @@ static int g_sort_columns_buffer_npts = 0;
 // =============================================================================
 // Constants controlling the behavior of parallel sorting algorithms.
 // These parameters tune the parallel sorting operations used when 
-// OpenMP is available, affecting the partitioning of data across threads
-// and the overlap required for correct merging of sorted sections.
+// OpenMP is available, affecting the partitioning of data across threads.
+// The sorted sections are combined by merge_sorted_chunks.
 
 /** 
  * Default number of sections when OpenMP is unavailable or reports few threads.
@@ -220,20 +230,6 @@ static const int PARALLEL_SORT_DEFAULT_SECTIONS = 8;
  * Multiplier used to determine total section count from available threads.
  */
 static const int PARALLEL_SORT_SECTIONS_PER_THREAD = 2;
-
-/**
- * Divisor for calculating proportional overlap between sort sections.
- * Overlap is calculated as chunk_size / OVERLAP_DIVISOR to scale with data size.
- */
-static const int PARALLEL_SORT_OVERLAP_DIVISOR = 8;
-
-/**
- * @brief Minimum required overlap between adjacent sort sections (in elements).
- * @details This ensures sufficient overlap for correct merging of sorted sections,
- *          particularly for sparse data distributions or when the calculated
- *          proportional overlap is small.
- */
-static const int PARALLEL_SORT_MIN_CORRECTNESS_OVERLAP = 32;
 
 
 /**
@@ -594,20 +590,193 @@ static double g_nfw_profile_rmax_norm_factor = CUTOFF_FACTOR_NFW_DEFAULT; ///< C
 static double g_nfw_profile_falloff_factor = FALLOFF_FACTOR_NFW_DEFAULT; ///< Falloff concentration parameter \f$C\f$ for the NFW profile. Populated from `g_falloff_factor_param`.
 
 /**
- * @brief Pre-calculated gravitational force constant.
- * @details Combines -G * M_total / npts * unit conversions to avoid repeated
- *          division in force calculations. Updated once before main time loop.
- *          Unused, functionality replaced by variable mass arrays in particles[].
+ * @brief Enclosed mass per rank: g_mass_prefix_sum[i] = sum of particles[P_MASS][0..i-1].
+ * @details The mass interior to the particle at index i of the radius-sorted array (its own
+ *          mass excluded). Rebuilt by `sort_particles` after every sort, and once before the
+ *          time loop; every rank-based force reads it. See rebuild_mass_prefix_sum.
  */
-static double g_precalc_force_const = 0.0;
+static double *g_mass_prefix_sum = NULL;
+static int g_mass_prefix_n = 0;        ///< Allocated length of g_mass_prefix_sum.
 
 /**
- * @brief Pre-calculated cumlulative sum of mass per rank.
- * @details Sum of the masses of all particles of smaller rank.
- *          Updated whenever the state vector is ordered.
+ * @brief Per-particle mass and species indexed by original particle ID (particles[3]).
+ * @details Filled once before the time loop from the particle array (or, in `--restart`
+ *          post-processing mode, from data/particle_species_mass<suffix>.dat). Post-processing
+ *          reads snapshot files that are indexed by particle ID, so it uses these arrays to
+ *          weight each particle by its own mass.
  */
-static double* g_mass_prefix_sum = NULL; // g_mass_prefix_sum[i] = sum of particles[8][0..i-1]
+static double *g_particle_mass_by_id = NULL;
+static int *g_particle_species_by_id = NULL;
 
+/**
+ * @brief Enclosed-mass field M(r) (method 1 only, `--menc-field`, optional `--menc-interp`).
+ * @details When enabled, every force evaluation uses the enclosed mass at the particle's
+ *          *current* radius, taken from the start-of-step radius distribution, instead of the
+ *          start-of-step rank value held fixed over the step. See MencSource and menc_at.
+ */
+static int g_menc_field = 0;           ///< Enable M(r) enclosed-mass field (0=off, 1=on). Default is OFF.
+static int g_menc_interp = 0;          ///< Linear interpolation of M(r) between radii (0=step function, default).
+/**
+ * @brief Smoothed enclosed-mass table (method 1 only, `--menc-smooth <K>`).
+ * @details When > 0, every force evaluation uses a smooth, monotone M(r) shared by all particles:
+ *          a PCHIP (monotone C1 cubic Hermite) interpolant through knots at start-of-step particle
+ *          radii, every K particles (finer near the centre, see build_menc_smooth_table). The knots
+ *          are stored in g_menc_field_tab with `M_below` = enclosed mass at the knot and `slope` =
+ *          PCHIP derivative dM/dr there.
+ *          Each particle's own mass is removed with a smoothstep of knot-interval width centred
+ *          on its start radius, i.e. DM is treated as a smooth mean field over K-particle scales.
+ */
+static int g_menc_smooth_k = 0;        ///< Knot spacing K in particles (0 = off).
+static int g_star_substeps = -1;       ///< --star-substeps M: stars are integrated first in M sub-steps and the dark matter
+                                       ///< sees their discrete, softened shells interpolated in time (0 = off). -1 = not
+                                       ///< given: STAR_SUBSTEPS_DEFAULT when the run has stars, uses --method 1 and
+                                       ///< --menc-smooth, otherwise off (resolved before the time loop).
+#define STAR_SUBSTEPS_DEFAULT 32       ///< Default M. Test of 2026-10-18 (r01 restarted at 1121 Myr): M >= 32 halves the
+                                       ///< energy drift of the heavy-star nucleus at no runtime cost; 64/128 gave no gain.
+/**
+ * --star-substep-method (with --star-substeps M; see run_star_substeps and star_substep_clusters):
+ *  1 = frozen partners. In every sub-step each star advances alone (leapfrog, or Levi-Civita below r_crit) in the
+ *      dark-matter table plus the other stars frozen at the start of the sub-step. Stars whose shells cross within a
+ *      sub-step pick up the frozen-partner energy error J.
+ *  2 = as 1, then joint re-integration in physical time. Stars whose radial sweeps overlap in the sub-step are grouped
+ *      into clusters (grow-only, at most STAR_SSC_MAX_REDOS redo rounds) and every cluster is re-integrated from the
+ *      start of the sub-step with all members advancing together in uniform physical-time leapfrog steps (coarse N vs
+ *      fine 2N drifts). A member with L > 0 that drifts through r = 0 is reflected; such a radius flip means the
+ *      step jumped over the angular-momentum barrier, so it forces another doubling of N and is logged. Flips still
+ *      present at the cap are accepted (counted as unresolved). Kept for comparison: near-centre stars are expensive
+ *      and inaccurate in this path.
+ *  3 = as 2, but clusters with a member on the Levi-Civita branch (or a member that still flips at the cap of the
+ *      physical-time path) are integrated jointly in a shared regularised time: dt = g dtau with
+ *      g = 1 / sum_{anchors} 1/r_k over the Levi-Civita members ("anchors"). With one anchor this is exactly the
+ *      single-star Levi-Civita scheme for the anchor, and its partners drift in the same physical time. A partner
+ *      that flips forces doubling and, if still flipping at the cap, becomes an anchor and the cluster is redone.
+ *      A joint integration (either path) that does not converge without a flip is redone with every member as an
+ *      anchor (a partner can pass its own pericentre inside the sub-step).
+ */
+static int g_star_substep_method = 1;  ///< --star-substep-method: 1, 2 or 3 (see above).
+#define STAR_SSC_MAX_REDOS 10          ///< --star-substep-method 2/3: re-integration rounds of grown clusters per sub-step.
+static double g_star_softening_pc = 1.0e-5; ///< --star-softening eps (pc): star-star softening of the star shells, see
+                                          ///< star_pair_smax, and of --star-star-rutherford's cross-section, see
+                                          ///< rutherford_sigma_T. 0 = off (sharp star-star shells, point masses).
+                                          ///< Default 1e-5 pc since 2026-11-10 (was 0.02): minimal stability softening.
+static double g_star_dm_softening_pc = 1.0e-5; ///< --star-dm-softening eps (pc): star-DM softening of --star-dm-rutherford's
+                                            ///< cross-section (Errani et al. 2026's eps_DM), see rutherford_sigma_T. 0 = off.
+                                            ///< Default 1e-5 pc since 2026-11-10 (was 0.1).
+static int g_star_dm_softening_provided = 0; ///< Flag: 1 if --star-dm-softening was given.
+static double g_star_dm_bmax_floor_pc = 0.0; ///< --star-dm-bmax-floor (pc): lower bound on --star-dm-rutherford's b_max,
+                                             ///< which otherwise falls to r near the centre (drag_bmax). 0 = off.
+static int g_star_dm_bmax_floor_provided = 0; ///< Flag: 1 if --star-dm-bmax-floor was given.
+
+/**
+ * @brief Chandrasekhar dynamical friction (drag) on stars (method 1 only, `--drag`).
+ * @details Ported from the "merged 041026" development version. Every particle of species != 0
+ *          feels a drag rate k (see drag_force) computed from the local dark-matter density (from the
+ *          smooth dark-matter M(r) table, dm_table_density), the velocity dispersion of its
+ *          DRAG_SIGMA_NEIGHBOURS nearest dark-matter rank neighbours and a variable Coulomb
+ *          logarithm ln Lambda = 1/2 ln(1 + (b_max v^2 / G m)^2) (see drag_force); after each kick its
+ *          radial velocity and angular momentum are multiplied by exp(-k * dt_kick). The local density,
+ *          the neighbours' mean squared speed and b_max are frozen per timestep in rho_snapshot /
+ *          vdm_sq_snapshot / bmax_snapshot.
+ *          Dark matter (species 0) is untouched: its integration is the same as without --drag.
+ */
+static int g_enable_drag_force = 0;    ///< Enable Chandrasekhar dynamical friction on stars (0=off, 1=on). Default is OFF.
+static int g_drag_no_radial = 0;       ///< --drag-no-radial: drag damps only L, not v_r (0=both, default).
+static int g_drag_random_deposit = 0;  ///< --drag-random-deposit: heat the dark matter with random-direction kicks instead of scaling its velocity.
+static double g_drag_softening_pc = 0.0; ///< --drag-softening eps (pc): spline-softened star-DM pair in drag's ln Lambda
+                                         ///< (ln Lambda = sigma_T / (4 pi b_90^2), rutherford_sigma_T with h = 2.8 eps). 0 = off.
+static int g_drag_softening_provided = 0; ///< Flag: 1 if --drag-softening was given.
+static uint64_t g_reheat_rng = 0x9E3779B97F4A7C15ULL; ///< State of the deterministic generator for the random-direction kicks.
+#define DRAG_SIGMA_NEIGHBOURS 64       ///< Dark-matter rank neighbours of a star used to estimate the local velocity dispersion.
+#define DRAG_BMAX_SHELL_FACTOR 1.5     ///< b_max: local density slope from the DM shells [r/f, r] and [r, r f], f = this.
+static double *rho_snapshot = NULL;    ///< Per-step local DM density at each star's rank (Msun/kpc^3); only star ranks are filled.
+static double *v_sq_snapshot = NULL;   ///< Per-step squared total speed v_r^2 + (L/r)^2 per rank (kpc^2/Myr^2).
+static double *vdm_sq_snapshot = NULL; ///< Per-step mean squared speed of the star's DRAG_SIGMA_NEIGHBOURS DM neighbours (kpc^2/Myr^2); star ranks only.
+static double *bmax_snapshot = NULL;   ///< Per-step maximum impact parameter b_max = min(r, rho/|drho/dr|) (kpc); star ranks only.
+static double *dm_menc_snapshot = NULL; ///< Per-step dark-matter mass at lower ranks (Msun), every rank (non-decreasing in rank).
+#define DRAG_REHEATING_BUFFER 1024     ///< Ranks on either side of a star whose dark matter absorbs the energy drag removes from it.
+static double *drag_dE_rank = NULL;     ///< Per-step energy drag removed from the star at each rank (Msun kpc^2/Myr^2); star ranks only.
+static int g_reheat_max_stars = 0;      ///< Capacity of the pending-deposit lists (number of particles with species != 0).
+static int g_reheat_n = 0;              ///< Number of pending deposits (stars that lost energy in the last step).
+static int *g_reheat_star_id = NULL;    ///< Pending deposit k: the star's particle ID.
+static double *g_reheat_dE = NULL;      ///< Pending deposit k: the energy to deposit (Msun kpc^2/Myr^2).
+static int *g_reheat_nstart = NULL;     ///< Pending deposit k: number of dark-matter IDs in its start-of-step window.
+static int *g_reheat_start_ids = NULL;  ///< Pending deposit k: start-of-step window DM IDs, at [k*(2*DRAG_REHEATING_BUFFER+1)].
+static double *lmin_snapshot = NULL;    ///< Per-step drag floor on |L| at each star's rank: L_circ at its influence radius (kpc^2/Myr); star ranks only.
+
+/**
+ * @brief Star-dark-matter gravitational (Rutherford) scattering (method 1 only, `--star-dm-rutherford`).
+ * @details A collisional alternative to --drag: each step every star (species != 0) scatters off its
+ *          g_star_dm_neighbours nearest dark-matter rank neighbours with the Rutherford
+ *          momentum-transfer cross-section, through the SIDM scatter update (see
+ *          perform_star_dm_rutherford). Each collision conserves energy and momentum, so no
+ *          reheating step is needed. Stars are then excluded from the --sidm (kappa) pass.
+ */
+static int g_star_dm_rutherford = 0;    ///< Enable star-DM Rutherford scattering (0=off, 1=on). Default is OFF.
+static int g_star_dm_neighbours = 10;   ///< --star-dm-neighbours: dark-matter rank neighbours each star scatters off per step.
+static int g_star_dm_neighbours_provided = 0; ///< Flag: 1 if --star-dm-neighbours was given.
+static double g_star_dm_s_total = 0.0;  ///< Sum over steps and pairs of s = n sigma_T v_rel dt (expected momentum-transfer collisions).
+static double g_star_dm_dE_total = 0.0; ///< Kinetic energy the stars lost to the dark matter in star-DM scatters (Msun kpc^2/Myr^2).
+/// Saturation diagnostic per star species (index species, capped at 3): [0] sum of s, [1] sum of 1 - exp(-s) (the
+/// momentum transfer actually applied, <1 - cos chi>), [2] sum of s over pairs with s > 0.1, [3] number of pairs.
+static double g_star_dm_sat[4][4];
+#define STAR_DM_SEED_SALT 0x5DEECE66DULL ///< XORed into the SIDM seed so the star-DM random stream is independent of --sidm.
+
+/**
+ * @brief Star-star gravitational (Rutherford) scattering (method 1 only, `--star-star-rutherford`).
+ * @details Once per step, every star scatters off its g_star_star_neighbours nearest star rank
+ *          neighbours on each side, among the stars of species 1-9 (any pair of these species,
+ *          including equal ones). Runs may hold particles of any species: species 0 is dark matter,
+ *          and stars of species outside 1-9 take no part in star-star scattering (they are not
+ *          partners and do not count in the density kernel; star_star_species). Compatible with
+ *          --drag, --star-dm-rutherford,
+ *          --star-substeps and --sidm (star-star pairs are then excluded from the kappa pass).
+ *          See perform_star_star_rutherford.
+ */
+static int g_star_star_rutherford = 0;     ///< Enable star-star Rutherford scattering (0=off, 1=on). Default is OFF.
+static int g_star_star_neighbours = 10;    ///< --star-star-neighbours: star rank neighbours on each side of a star (pair window |a-b| <= k).
+static int g_star_star_neighbours_provided = 0; ///< Flag: 1 if --star-star-neighbours was given.
+static unsigned long int g_star_star_seed = 0;  ///< Seed of the star-star random stream (--star-star-seed, or master seed + 3).
+static int g_star_star_seed_provided = 0;       ///< Flag: 1 if --star-star-seed was given.
+static const char *g_star_star_seed_filename_base = "data/last_star_star_seed"; ///< Base name for the star-star seed file.
+#define STAR_MAX_SPECIES 9 ///< Highest species taking part in star-star scattering (species 1..STAR_MAX_SPECIES).
+/// 1 if a particle of species `sp` takes part in --star-star-rutherford (an integer species 1-9).
+static inline int star_star_species(double sp)
+{
+    return sp >= 1.0 && sp <= (double)STAR_MAX_SPECIES && sp == floor(sp);
+}
+static int *g_star_star_rank = NULL;    ///< Scratch: ranks of the stars in the current (radius-sorted) order.
+static int g_star_star_nstars = 0;      ///< Number of stars of species 1-9 (allocated length of g_star_star_rank).
+/// Star-star diagnostics, accumulated over the run.
+static struct
+{
+    double s_total;          ///< Sum over steps and pair visits of s (half the expected momentum-transfer collisions per visit).
+    double pair_sat[STAR_MAX_SPECIES + 1][STAR_MAX_SPECIES + 1][3]; ///< Per species pair (lower, higher): [0] sum s, [1] sum (1 - e^-s), [2] visits.
+    double n_big_s;          ///< Visits with s > 1 (randomised pair: the step does not resolve the relaxation there).
+    double dK_species[STAR_MAX_SPECIES + 1]; ///< Kinetic energy gained by each species in star-star scatters (Msun kpc^2/Myr^2).
+    double max_rel_dE;       ///< Largest |sum dK| / K_stars of one step (round-off; scatters are exactly conservative).
+    double time_total;       ///< Wall time spent in perform_star_star_rutherford (s).
+    long long steps;         ///< Number of calls.
+} g_ssr;
+static int g_menc_smooth_nk = 0;       ///< Number of knots in the current smooth table.
+
+/**
+ * @brief One rank (or smooth-table knot) of the start-of-step enclosed-mass field, packed so a
+ *        lookup touches one record.
+ * @details Rebuilt after every start-of-step sort (see the method-1 loop). For `--menc-field`
+ *          there is one entry per rank: `M_below` is the mass of all lower ranks
+ *          (g_mass_prefix_sum) and `slope` is that rank's own mass divided by the gap to the next
+ *          radius, so the interpolated lookup is a multiply-add with no division:
+ *          \f$M(r) = M_{below} + slope \cdot (r - r_{rank})\f$ for \f$r\f$ between this rank's
+ *          radius and the next one. For `--menc-smooth` the entries are PCHIP knots (see
+ *          build_menc_smooth_table) and `half_m` is used as described there.
+ */
+typedef struct {
+    double r;        ///< Start-of-step radius of this rank or knot (kpc).
+    double M_below;  ///< Mass of all lower ranks (Msun).
+    double slope;    ///< Field: rank mass / gap to the next radius (Msun/kpc), 0 for a zero gap or the last rank. Smooth: PCHIP dM/dr.
+    double half_m;   ///< Smooth only: half the mean particle mass around this knot (Msun), see build_menc_smooth_table.
+} MencFieldEntry;
+static MencFieldEntry *g_menc_field_tab = NULL; ///< Start-of-step field, indexed by rank (read-only during integration).
 
 // Generalized Profile Parameters (set by command line flags)
 static double g_scale_radius_param = RC;        ///< Generalized scale radius (kpc), defaults to RC macro.
@@ -661,15 +830,6 @@ static double g_cored_profile_rc = RC;              ///< Scale radius \f$r_c\f$ 
 static double g_cored_profile_halo_mass = HALO_MASS; ///< Total halo mass for the Cored profile (\f$M_{\odot}\f$). Populated from `g_halo_mass_param`.
 static double g_cored_profile_rmax_factor = CUTOFF_FACTOR_CORED_DEFAULT;   ///< Cutoff radius factor for the Cored profile. Populated from `g_cutoff_factor_param`.
 
-// =============================================================================
-// BARYON MODEL PARAMETERS
-// =============================================================================
-// Baryon constants for the many-species model
-static double g_baryon_mass_fraction = 0.0;  ///< Fraction of baryons in the system, set by the '--baryon-fraction' option.
-static int    g_npts_dm = 0;                 ///< Number of dark matter particles in the simulation Set by the '--npts_dm' option.
-static int    g_npts_bar = 0;                ///< Number of baryon particles in the simulation. Set by the '--npts_bar' option.
-
-
 /**
  * @brief Conditional compilation macros for feature flags.
  * @details These macros provide a cleaner syntax for conditional code blocks
@@ -705,6 +865,17 @@ int debug_direct_convolution = 0;
 #define G_CONST 4.3e-6           ///< Newton's gravitational constant in kpc (km/sec)\f$^2\f$/\f$M_{\odot}\f$.
 #define kmsec_to_kpcmyr 1.02271e-3 ///< Conversion factor: km/s to kpc/Myr.
 #define VEL_CONV_SQ (kmsec_to_kpcmyr * kmsec_to_kpcmyr) ///< Velocity conversion squared (kpc/Myr)\f$^2\f$ per (km/s)\f$^2\f$.
+
+/**
+ * @brief Layout of the main particle array `particles[field][index]`.
+ * @details Rows 0-6: radius, radial velocity (or speed before the unit conversion), angular
+ *          momentum, original ID, mu, cos(phi), sin(phi). Rows 7-8: species (0 = dark matter,
+ *          >= 1 = other populations) and per-particle mass (Msun). Every place that needs a
+ *          particle's mass reads `particles[P_MASS][i]`; enclosed masses are prefix sums of it.
+ */
+#define P_SPECIES 7          ///< Row index of the particle species.
+#define P_MASS 8             ///< Row index of the particle mass (Msun).
+#define N_PARTICLE_FIELDS 9  ///< Number of rows in `particles`.
 
 // Mathematical utility macros
 #define sqr(x) ((x) * (x))       ///< Calculates the square of a value: \f$x^2\f$.
@@ -769,11 +940,7 @@ static inline double get_deterministic_rand(uint64_t seed, int step, int id, int
 #define RADIX_SIZE (1 << RADIX_BITS) ///< Number of buckets for radix sort (\f$2^8 = 256\f$).
 #define RADIX_MASK (RADIX_SIZE - 1)  ///< Bit mask for extracting radix bucket index (0xFF).
 
-// Additional macros for efficient scaling of codebase
-#define N_PARTICLE_PARAMS 10         ///< Number of parameters in the **particles array. Used for easier future development
-#define N_BYTES_PER_RECORD 20        ///< Number of bytes per record in the output file. currently 1 int, 3 float, 1 int.
-
-static double g_active_halo_mass = HALO_MASS; ///< Active halo mass for N-body force calculations.
+static double g_active_halo_mass = HALO_MASS; ///< Halo mass used to assign initial particle masses (halo_mass / npts); forces and tdyn use particles[P_MASS].
 
 /**
  * @brief Angular momentum selection configuration for particle filtering.
@@ -796,8 +963,6 @@ static float *Vrad_block = NULL; ///< Radial velocity block.
 static float *phi_block = NULL;   ///< Phi angle block.
 static int *scatter_count_block = NULL; ///< Scatter count block.
 static int *ID_block = NULL;      ///< Particle ID block (original IDs).
-static int* species_block = NULL; ///< Pariticle species block
-static float* mass_block = NULL;  ///< Pariticle mass block
 
 // =============================================================================
 // TRAJECTORY BUFFERING SYSTEM
@@ -908,7 +1073,6 @@ void cleanup_all_particle_data(void)
     free(phi_block);
     free(scatter_count_block);
     free(ID_block);
-    free(species_block);
 
     // Free double precision buffer arrays
     free(g_dbl_buf_R);
@@ -1256,13 +1420,6 @@ static void allocate_trajectory_buffers(int num_traj_particles, int nlowest, int
         fprintf(stderr, "ERROR: Failed to allocate initial value arrays\n");
         CLEAN_EXIT(1);
     }
-
-    // Allocate prefix sum of masses
-    g_mass_prefix_sum = (double*)calloc(npts, sizeof(double));
-    if (!g_mass_prefix_sum) {
-        fprintf(stderr, "ERROR: Failed to allocate prefix sum of masses\n");
-        CLEAN_EXIT(1);
-    }
 }
 
 /**
@@ -1410,9 +1567,9 @@ static void cleanup_trajectory_buffers(int num_traj_particles, int nlowest) {
     free(g_E_init_vals);
     free(g_L_init_vals);
 
-    // Free prefix sum of masses
-    free(g_mass_prefix_sum);
-    g_mass_prefix_sum = NULL;
+    // Free M(r) field buffer
+    free(g_menc_field_tab);
+    g_menc_field_tab = NULL;
 }
 
 /**
@@ -1435,7 +1592,7 @@ static int find_last_common_complete_snapshot(int npts, int dtwrite, int num_tra
     int min_complete_snapshot = INT_MAX;
 
     // Bytes per snapshot/timestep for each file type
-    int bytes_per_snapshot_apd = npts * N_BYTES_PER_RECORD;  // defined in the macro
+    int bytes_per_snapshot_apd = npts * 16;  // int + 3 floats
     int bytes_per_snapshot_ids = npts * 4;   // 1 int
     int bytes_per_snapshot_phi = npts * 4;   // 1 float
     int bytes_per_snapshot_scatter = npts * 4; // 1 int
@@ -1586,7 +1743,7 @@ static int truncate_files_to_snapshot(int last_snapshot, int npts, int dtwrite,
         const char* name;
         long target_size;
     } snapshot_files[] = {
-        {"data/all_particle_data", (long)snapshots_to_keep * npts * N_BYTES_PER_RECORD},
+        {"data/all_particle_data", (long)snapshots_to_keep * npts * 16},
         {"data/all_particle_ids", (long)snapshots_to_keep * npts * 4},
         {"data/all_particle_phi", (long)snapshots_to_keep * npts * 4},
         {"data/all_particle_scatter_counts", (long)snapshots_to_keep * npts * 4},
@@ -1682,21 +1839,14 @@ static int use_identity_gravity = 0;
 /**
  * @brief Calculates gravitational acceleration at a given radius.
  *
- * @param r [in] Radius in kpc.
- * @param current_rank [in] Particle rank (0 to npts-1).
- * @param npts [in] Total number of particles.
- * @param G_value [in] Gravitational constant value (e.g., G_CONST).
- * @param halo_mass_value [in] Total halo mass (e.g., HALO_MASS).
+ * @param r     [in] Radius in kpc.
+ * @param M_enc [in] Enclosed mass (Msun), e.g. g_mass_prefix_sum[rank] or a MencSource value.
  * @return Gravitational acceleration (force per unit mass) in simulation units (kpc/Myr\f$^2\f$).
  *
  * @note Returns 0.0 if `use_identity_gravity` is set to 1.
- * @note \f$M(r)\f$ is obtained from g_mass_prefix_sum, see its definition.
  */
-static inline double gravitational_force(double r, int current_rank, int npts, double G_value, double halo_mass_value)
+static inline double gravitational_force(double r, double M_enc)
 {
-    (void)npts;
-    (void)G_value;
-    (void)halo_mass_value;
     if (use_identity_gravity)
     {
         return 0.0;
@@ -1704,7 +1854,6 @@ static inline double gravitational_force(double r, int current_rank, int npts, d
     else
     {
         double r_sq_inv = 1.0 / (r * r);
-        double M_enc = g_mass_prefix_sum[current_rank]; // sum of masses for all particles interior to this one
         return -(VEL_CONV_SQ * G_CONST) * M_enc * r_sq_inv;
     }
 }
@@ -1726,21 +1875,15 @@ static inline double effective_angular_force(double r, double ell)
  * @details Used in the Levi-Civita regularization scheme. Calculates F/m in rho coordinates.
  *
  * @param rho [in] Transformed radial coordinate (sqrt(r)). Units: sqrt(kpc).
- * @param current_rank [in] Particle rank (0 to npts-1).
- * @param npts [in] Total number of particles.
- * @param G_value [in] Gravitational constant value (e.g., G_CONST).
- * @param halo_mass_value [in] Total halo mass (e.g., HALO_MASS).
+ * @param M_enc [in] Enclosed mass (Msun), from g_mass_prefix_sum or a MencSource.
  * @return \f$dv/d\tau\f$ in Levi-Civita coordinates (kpc\f$^2\f$/Myr\f$^2\f$).
  *
  * @note Returns 0.0 if `use_identity_gravity` is set to 1.
  * @see gravitational_force
  * @see doLeviCivitaLeapfrog
  */
-static inline double gravitational_force_rho_v(double rho, int current_rank, int npts, double G_value, double halo_mass_value)
+static inline double gravitational_force_rho_v(double rho, double M_enc)
 {
-    (void)npts;
-    (void)G_value;
-    (void)halo_mass_value;
     if (use_identity_gravity)
     {
         return 0.0;
@@ -1748,7 +1891,6 @@ static inline double gravitational_force_rho_v(double rho, int current_rank, int
     else
     {
         double rho_sq_inv = 1.0 / (rho * rho);
-        double M_enc = g_mass_prefix_sum[current_rank]; // sum of masses for all particles interior to this one
         return -(VEL_CONV_SQ * G_CONST) * M_enc * rho_sq_inv;
     }
 }
@@ -1767,6 +1909,1046 @@ static inline double gravitational_force_rho_v(double rho, int current_rank, int
 static inline double effective_angular_force_rho_v(double rho, double ell)
 {
     return (ell * ell) / (rho * rho * rho * rho);
+}
+
+/**
+ * @brief Source of the enclosed mass seen by one particle during one timestep.
+ * @details Either a constant (the classic rank-based value g_mass_prefix_sum[rank], held fixed
+ *          over the step), the start-of-step mass field \f$M(r)\f$ evaluated at the particle's
+ *          *current* radius at every force evaluation (`--menc-field`), or the smooth shared table
+ *          (`--menc-smooth`). The particle's own mass is excluded. All masses are in Msun.
+ *          With a field, a particle that crosses other particles during the step feels the
+ *          enclosed mass change as it crosses them, instead of the start-of-step value; the
+ *          frozen-rank value otherwise heats the system by the stale-rank energy mismatch.
+ *
+ * @note One instance per particle per step, on that thread's stack. The tables are read-only
+ *       during the integration pass; only `hint` is mutated, and it never affects the result,
+ *       so the scheme is thread safe and deterministic.
+ */
+typedef struct {
+    int use_field;          ///< 0: constant M_const; 1: M(r) from the start-of-step field; 2: smooth PCHIP table (`--menc-smooth`);
+                            ///< 3: smooth dark-matter-only table plus discrete star shells (`--star-substeps`).
+    int interp;             ///< 1: linear interpolation of M(r) between neighbouring radii (`--menc-interp`).
+    double M_const;         ///< Constant enclosed mass (use_field == 0) (Msun).
+    const MencFieldEntry *field; ///< Start-of-step field or knot table, ascending in radius.
+    int npts;               ///< Number of entries in `field`.
+    double M_total;         ///< Field mode: total mass of all particles (Msun).
+    int self_idx;           ///< This particle's start-of-step rank; its own mass is excluded.
+    double self_mass;       ///< This particle's own mass (Msun).
+    int hint;               ///< Search hint: last lower-bound index found (per-particle, mutable).
+    double self_r0;         ///< Smooth mode: start-of-step radius of this particle (centre of its own-mass step).
+    double self_w;          ///< Smooth mode: width of the smoothed own-mass step (local knot interval).
+    const struct StarProfile *stars; ///< use_field 3: discrete star shells added to the dark-matter-only smooth table.
+    int self_star;          ///< use_field 3: this star's index in `stars` (its own shell is excluded), or -1.
+    int star_hint_hi;       ///< use_field 3: search hint into the star bands' upper edges (mutable, result-neutral).
+    int star_hint_lo;       ///< use_field 3: search hint into the star bands' lower edges (mutable, result-neutral).
+    double t;               ///< Time since the start of the step (Myr) of the current force evaluation; set by
+                            ///< the micro-integrators, read only by use_field 3.
+} MencSource;
+
+/**
+ * @brief Creates a constant enclosed-mass source.
+ *
+ * @param M_enc [in] Enclosed mass held fixed over the step (Msun), classically g_mass_prefix_sum[rank].
+ * @return MencSource Source that always returns `M_enc`.
+ */
+static inline MencSource menc_source_const(double M_enc)
+{
+    MencSource src;
+    memset(&src, 0, sizeof(src));
+    src.use_field = 0;
+    src.M_const = M_enc;
+    return src;
+}
+
+/**
+ * @brief Creates an enclosed-mass source that evaluates the start-of-step field M(r).
+ *
+ * @param self_idx  [in] Particle's start-of-step rank (its own mass is excluded).
+ * @param field     [in] Packed start-of-step field, ascending in radius.
+ * @param npts      [in] Number of particles.
+ * @param M_total   [in] Total mass of all particles (Msun).
+ * @param self_mass [in] Particle's own mass (Msun).
+ * @param interp    [in] 1 for linear interpolation between neighbouring radii, 0 for the step function.
+ * @return MencSource Field source with its search hint initialised at `self_idx`.
+ */
+static inline MencSource menc_source_field(int self_idx, const MencFieldEntry *field, int npts,
+                                           double M_total, double self_mass, int interp)
+{
+    MencSource src;
+    memset(&src, 0, sizeof(src));
+    src.use_field = 1;
+    src.interp = interp;
+    src.field = field;
+    src.npts = npts;
+    src.M_total = M_total;
+    src.self_idx = self_idx;
+    src.self_mass = self_mass;
+    src.hint = self_idx;
+    return src;
+}
+
+/**
+ * @brief Creates an enclosed-mass source that evaluates the smooth PCHIP table (`--menc-smooth`).
+ *
+ * @details The particle's own mass is excluded by subtracting its mass times a C1 smoothstep
+ *          centred on its start-of-step radius, as wide as the knot interval containing that
+ *          radius, i.e. its own mass is smoothed on the same scale as everyone else's (see menc_at).
+ *
+ * @param self_idx  [in] Particle's start-of-step rank (seeds the search hint).
+ * @param self_r0   [in] Particle's start-of-step radius (kpc).
+ * @param self_mass [in] Particle's own mass (Msun).
+ * @param knots     [in] Knot table (r ascending, M_below = enclosed mass, slope = dM/dr).
+ * @param nk        [in] Number of knots.
+ * @param k_spacing [in] Knot spacing K in particles.
+ * @return MencSource Smooth source with its search hint initialised near `self_idx / K`.
+ */
+static inline int menc_lower_bound(const MencFieldEntry *fld, int n, double r, int hint);
+static inline MencSource menc_source_smooth(int self_idx, double self_r0, double self_mass,
+                                            const MencFieldEntry *knots, int nk, int k_spacing)
+{
+    MencSource src;
+    memset(&src, 0, sizeof(src));
+    src.use_field = 2;
+    src.field = knots;
+    src.npts = nk;
+    src.self_idx = self_idx;
+    src.self_mass = self_mass;
+    src.self_r0 = self_r0;
+
+    int k = menc_lower_bound(knots, nk, self_r0, self_idx / k_spacing);
+    src.hint = k;
+    if (nk < 2)
+        src.self_w = 0.0;
+    else if (k <= 0)
+        src.self_w = knots[1].r - knots[0].r;
+    else if (k >= nk)
+        src.self_w = knots[nk - 1].r - knots[nk - 2].r;
+    else
+        src.self_w = knots[k].r - knots[k - 1].r;
+    return src;
+}
+
+/**
+ * @brief Builds the smooth M(r) knot table for `--menc-smooth` from radius-sorted particles.
+ * @details Knots sit at ranks spaced by min(K, max(1, rank/16)) (fine at the centre, every K
+ *          particles further out) plus the last rank, with value M_below = enclosed mass of all
+ *          lower ranks (g_mass_prefix_sum). Knots with non-increasing radius are skipped.
+ *          Derivatives follow Fritsch-Carlson / PCHIP (weighted harmonic mean of neighbouring
+ *          secants, zero at a local extremum), which keeps the interpolant monotone and C1.
+ *          `half_m` of each knot is half the mean particle mass of the adjacent intervals (the
+ *          average of the two at interior knots); menc_at blends it across each interval to
+ *          recentre the curve, which runs along the lower corners of the mass staircase.
+ *
+ * @param r        [in]  Radius-sorted start-of-step radii.
+ * @param m_below  [in]  Enclosed mass per rank (g_mass_prefix_sum for the same ordering).
+ * @param npts     [in]  Number of particles.
+ * @param K        [in]  Knot spacing in particles (>= 2).
+ * @param knots    [out] Knot table (allocate npts + 2 entries).
+ * @return int Number of knots written.
+ */
+static int build_menc_smooth_table(const double *r, const double *m_below, int npts, int K, MencFieldEntry *knots)
+{
+    int nk = 0;
+    int idx = 0;
+    while (idx < npts)
+    {
+        if (nk == 0 || r[idx] > knots[nk - 1].r)
+        {
+            knots[nk].r = r[idx];
+            knots[nk].M_below = m_below[idx];
+            knots[nk].half_m = (double)idx; // Rank, converted to half_m below
+            nk++;
+        }
+        // Spacing grows with rank up to K, so the centre (where M(r) is steep and curved, e.g.
+        // M ~ r^2 in a cusp) is resolved to ~1/16 of the enclosed count instead of K particles.
+        int step = idx / 16;
+        if (step < 1) step = 1;
+        if (step > K) step = K;
+        idx += step;
+    }
+    if (nk == 0 || r[npts - 1] > knots[nk - 1].r)
+    {
+        knots[nk].r = r[npts - 1];
+        knots[nk].M_below = m_below[npts - 1];
+        knots[nk].half_m = (double)(npts - 1);
+        nk++;
+    }
+
+    if (nk == 1)
+    {
+        knots[0].slope = 0.0;
+        knots[0].half_m = 0.0;
+        return nk;
+    }
+
+    // Half the mean particle mass of each interval (from the ranks stored in half_m above),
+    // then assigned to knots as the average of the two adjacent intervals, so that blending
+    // between knot values (menc_at) gives an offset that is continuous across knots.
+    double h_prev_int = 0.0;
+    for (int k = 0; k < nk - 1; k++)
+    {
+        double n_in = knots[k + 1].half_m - knots[k].half_m;
+        double h_int = 0.5 * (knots[k + 1].M_below - knots[k].M_below) / n_in;
+        knots[k].half_m = (k == 0) ? h_int : 0.5 * (h_prev_int + h_int);
+        h_prev_int = h_int;
+    }
+    knots[nk - 1].half_m = h_prev_int;
+
+    double d_prev = 0.0, h_prev = 0.0;
+    for (int k = 0; k < nk - 1; k++)
+    {
+        double h = knots[k + 1].r - knots[k].r;
+        double d = (knots[k + 1].M_below - knots[k].M_below) / h;
+        if (k == 0)
+        {
+            knots[0].slope = d;
+        }
+        else
+        {
+            // Interior derivative at knot k from secants d_prev (left) and d (right).
+            if (d_prev <= 0.0 || d <= 0.0)
+            {
+                knots[k].slope = 0.0;
+            }
+            else
+            {
+                double w1 = 2.0 * h + h_prev;
+                double w2 = h + 2.0 * h_prev;
+                knots[k].slope = (w1 + w2) / (w1 / d_prev + w2 / d);
+            }
+        }
+        d_prev = d;
+        h_prev = h;
+    }
+    knots[nk - 1].slope = d_prev;
+    return nk;
+}
+
+/**
+ * @brief Returns the number of field entries whose radius is strictly below `r`.
+ * @details Galloping search outward from `hint` followed by a binary search, so the cost is
+ *          O(log d) where d is the distance from the hint; a particle moves only a few ranks
+ *          per micro-step, so this is close to O(1) in practice.
+ *
+ * @param fld  [in] Field entries, ascending in radius.
+ * @param n    [in] Number of entries.
+ * @param r    [in] Query radius.
+ * @param hint [in] Starting guess for the result, in [0, n].
+ * @return int k in [0, n] such that fld[k-1].r < r (or k == 0) and fld[k].r >= r (or k == n).
+ */
+static inline int menc_lower_bound(const MencFieldEntry *fld, int n, double r, int hint)
+{
+    int lo, hi;
+    if (hint < 0) hint = 0;
+    if (hint > n) hint = n;
+
+    if (hint < n && !(fld[hint].r >= r))
+    {
+        // Answer is above hint: gallop upward.
+        lo = hint + 1;
+        hi = lo;
+        int step = 1;
+        while (hi < n && fld[hi].r < r)
+        {
+            lo = hi + 1;
+            hi += step;
+            step <<= 1;
+        }
+        if (hi > n) hi = n;
+    }
+    else if (hint > 0 && !(fld[hint - 1].r < r))
+    {
+        // Answer is below hint: gallop downward.
+        hi = hint - 1;
+        lo = hi;
+        int step = 1;
+        while (lo > 0 && !(fld[lo - 1].r < r))
+        {
+            hi = lo - 1;
+            lo -= step;
+            step <<= 1;
+        }
+        if (lo < 0) lo = 0;
+    }
+    else
+    {
+        return hint;
+    }
+
+    // First index in [lo, hi] with fld[index].r >= r (hi is known to qualify, or hi == n).
+    while (lo < hi)
+    {
+        int mid = lo + (hi - lo) / 2;
+        if (fld[mid].r < r)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
+// =============================================================================
+// DISCRETE STAR SHELLS (--star-substeps)
+// =============================================================================
+// With --star-substeps M the enclosed mass is split into a smooth dark-matter-only table (the
+// usual --menc-smooth PCHIP table, built from the dark matter alone) and the stars, which are few
+// and heavy, as discrete shells. Each step the stars are integrated first, in M sub-steps, and
+// their radii are kept at the M+1 sub-step boundaries; the dark matter then sees each star at
+// its radius linearly interpolated in time between those snapshots. A star's mass enters M(r)
+// over the softened band r_s (1 +- STAR_SHELL_SOFTENING) by a C2 smoothstep, which keeps the
+// force continuous so the adaptive integrators converge normally across a star's shell.
+
+#define STAR_SHELL_SOFTENING 1.0e-3   ///< Relative half-width of a star's shell in M(r) (--star-substeps).
+
+/**
+ * @brief The star shells over one time interval: radii at its start and end and lookup tables.
+ * @details Each star's band [lo, hi] covers its softened shell at every time in the interval
+ *          (linear motion between r0 and r1). Stars with hi < r are fully enclosed at r, stars
+ *          with lo > r not at all; only the few whose band contains r are evaluated in detail.
+ */
+typedef struct {
+    const double *r0;       ///< Per-star radius at the start of the interval (kpc), by star index.
+    const double *r1;       ///< Per-star radius at the end of the interval (kpc), by star index.
+    double *hi_by_star;     ///< Per-star upper band edge (kpc), by star index.
+    double *lo_sorted;      ///< Lower band edges, ascending (kpc).
+    int *lo_idx;            ///< Star index of each lo_sorted entry.
+    double *hi_sorted;      ///< Upper band edges, ascending (kpc).
+    double *hi_mcum;        ///< Cumulative star mass over hi_sorted, inclusive (Msun).
+    double wmax;            ///< Widest band (kpc); bounds the search for bands containing r.
+} StarInterval;
+
+/**
+ * @brief All star shells of one step: n_iv consecutive intervals of length h_sub.
+ * @details h_sub <= 0 marks a single frozen interval (used for the stars' own sub-steps).
+ */
+typedef struct StarProfile {
+    int ns;                 ///< Number of stars.
+    int n_iv;               ///< Number of intervals.
+    double h_sub;           ///< Interval length (Myr); <= 0 for one frozen interval.
+    const double *m;        ///< Per-star mass (Msun), by star index.
+    const StarInterval *iv; ///< The intervals.
+    double m_total;         ///< Total star mass (Msun).
+    double soft_h;          ///< Star-star softening support h (kpc) for the stars' own phase; 0 = smoothstep shells.
+} StarProfile;
+
+// -----------------------------------------------------------------------------
+// STAR-STAR SOFTENING (--star-softening)
+// -----------------------------------------------------------------------------
+// Taken from Errani et al. (2026, arXiv:2604.06304), who soften star-star forces with a Plummer-equivalent
+// eps_* = 0.02 pc (spline kernel, exactly Newtonian beyond 2.8 eps). REQUIRES TESTING: the 1D analogue below is
+// our own construction, and whether it reduces the heavy-star nucleus energy drift has not been checked yet.
+// Two star shells interact through the pair potential -G m_i m_j / smax(r_i, r_j), with smax a C2 smooth
+// maximum that equals max(r_i, r_j) once |r_i - r_j| >= h = 2.8 eps (exact sharp shells there, like the spline
+// kernel), and exceeds it by at most 3h/16 inside. Being a pair potential, it conserves energy exactly (the
+// stars' own phase uses it; calculate_system_energies adds the matching correction), and it is regular at r = 0.
+// Errani soften dark matter with eps_DM = 0.1 pc; in the mean field that is not reproduced: the dark matter still
+// sees the star shells as before (smoothstep over r(1 +- STAR_SHELL_SOFTENING)). The collisions are softened too:
+// --star-star-rutherford with this eps_* and --star-dm-rutherford with --star-dm-softening (see
+// rutherford_sigma_T), both default 1e-5 pc since 2026-11-10 (not Errani's 0.02 / 0.1 pc); there eps_* applies
+// with or without --star-substeps.
+#define STAR_SOFT_KERNEL 2.8          ///< Support h = STAR_SOFT_KERNEL * eps (spline-kernel convention).
+
+/** @brief Star-star softening support h (kpc) from --star-softening, 0 when off. */
+static inline double star_soft_h_kpc(void)
+{
+    return STAR_SOFT_KERNEL * g_star_softening_pc * 1.0e-3;
+}
+
+/**
+ * @brief Smooth maximum of radii a, b with support h: (a + b)/2 + h Q(|a - b|/h)/2, Q(x) = 3/8 + 3x^2/4 - x^4/8
+ *        for x < 1 (C2 match to |a - b| at x = 1). Optionally returns d smax / d a.
+ */
+static inline double star_pair_smax(double a, double b, double h, double *dsda)
+{
+    double d = a - b, ad = fabs(d);
+    if (ad >= h)
+    {
+        if (dsda) *dsda = (d > 0.0) ? 1.0 : 0.0;
+        return (d > 0.0) ? a : b;
+    }
+    double x = ad / h, x2 = x * x;
+    if (dsda) *dsda = 0.5 + 0.5 * (1.5 * x - 0.5 * x * x2) * ((d > 0.0) ? 1.0 : -1.0);
+    return 0.5 * (a + b) + 0.5 * h * (0.375 + 0.75 * x2 - 0.125 * x2 * x2);
+}
+
+/**
+ * @brief Enclosed mass fraction (0..1) of a softened star shell at rs as seen by a star at r: the force
+ *        -G m_j (d smax/d r) / smax^2 written as G (fraction m_j) / r^2. Sharp step for |r - rs| >= h.
+ */
+static inline double star_soft_fraction(double r, double rs, double h)
+{
+    double dsda;
+    double s = star_pair_smax(r, rs, h, &dsda);
+    return r * r * dsda / (s * s);
+}
+
+/**
+ * @brief Enclosed fraction (0..1) at radius r of a star shell at radius rs: a C2 smoothstep over
+ *        rs (1 +- STAR_SHELL_SOFTENING), a sharp step for rs <= 0.
+ */
+static inline double star_shell_fraction(double r, double rs)
+{
+    if (!(rs > 0.0))
+        return (r > rs) ? 1.0 : 0.0;
+    double x = (r - rs) / (STAR_SHELL_SOFTENING * rs);
+    if (x <= -1.0)
+        return 0.0;
+    if (x >= 1.0)
+        return 1.0;
+    double u = 0.5 * (x + 1.0);
+    return u * u * u * (10.0 + u * (-15.0 + 6.0 * u));
+}
+
+/**
+ * @brief Number of entries of the ascending array a[0..n) below x (a[k] < x, or a[k] <= x if
+ *        `inclusive`), by galloping outward from `hint` and then bisecting: O(1) when the answer
+ *        is near the hint, as it is for successive force evaluations of one particle.
+ */
+static inline int star_count_below(const double *a, int n, double x, int hint, int inclusive)
+{
+#define STAR_BELOW(v) (inclusive ? ((v) <= x) : ((v) < x))
+    if (hint < 0) hint = 0;
+    if (hint > n) hint = n;
+    int lo, hi;
+    if (hint < n && STAR_BELOW(a[hint]))
+    {
+        lo = hint + 1;
+        hi = lo;
+        int step = 1;
+        while (hi < n && STAR_BELOW(a[hi]))
+        {
+            lo = hi + 1;
+            hi += step;
+            step <<= 1;
+        }
+        if (hi > n) hi = n;
+    }
+    else if (hint > 0 && !STAR_BELOW(a[hint - 1]))
+    {
+        hi = hint - 1;
+        lo = hi;
+        int step = 1;
+        while (lo > 0 && !STAR_BELOW(a[lo - 1]))
+        {
+            hi = lo - 1;
+            lo -= step;
+            step <<= 1;
+        }
+        if (lo < 0) lo = 0;
+    }
+    else
+        return hint;
+    while (lo < hi)
+    {
+        int mid = lo + (hi - lo) / 2;
+        if (STAR_BELOW(a[mid])) lo = mid + 1; else hi = mid;
+    }
+    return lo;
+#undef STAR_BELOW
+}
+
+/**
+ * @brief Star mass (Msun) enclosed at radius r at time t (Myr since the start of the step).
+ * @details Picks the interval containing t and interpolates each star's radius linearly within
+ *          it. Two searches over the star bands (galloping from the caller's hints, which they
+ *          update) plus the few bands containing r. The star `self` (if >= 0) is excluded.
+ */
+static inline double star_mass_at(const StarProfile *P, double r, double t, int self, int *hint_hi, int *hint_lo)
+{
+    const int ns = P->ns;
+    if (ns == 0)
+        return 0.0;
+    int j = 0;
+    double f = 0.0;
+    if (P->h_sub > 0.0)
+    {
+        double x = t / P->h_sub;
+        if (x > 0.0)
+        {
+            j = (int)x;
+            if (j > P->n_iv - 1)
+                j = P->n_iv - 1;
+            f = x - (double)j;
+            if (f > 1.0)
+                f = 1.0;
+        }
+    }
+    const StarInterval *I = &P->iv[j];
+    double M;
+    if (r < I->lo_sorted[0])
+        M = 0.0;
+    else if (r > I->hi_sorted[ns - 1])
+        M = P->m_total;
+    else
+    {
+        int a = star_count_below(I->hi_sorted, ns, r, *hint_hi, 0); // bands entirely below r
+        *hint_hi = a;
+        M = (a > 0) ? I->hi_mcum[a - 1] : 0.0;
+        int c = star_count_below(I->lo_sorted, ns, r, *hint_lo, 1); // bands starting at or below r
+        *hint_lo = c;
+        double rmin = r - I->wmax;
+        for (int q = c - 1; q >= 0 && I->lo_sorted[q] >= rmin; q--)
+        {
+            int st = I->lo_idx[q];
+            if (I->hi_by_star[st] >= r)
+            {
+                double rs = I->r0[st] + f * (I->r1[st] - I->r0[st]);
+                M += P->m[st] * (P->soft_h > 0.0 ? star_soft_fraction(r, rs, P->soft_h) : star_shell_fraction(r, rs));
+            }
+        }
+    }
+    if (self >= 0)
+    {
+        double rs = I->r0[self] + f * (I->r1[self] - I->r0[self]);
+        M -= P->m[self] * (P->soft_h > 0.0 ? star_soft_fraction(r, rs, P->soft_h) : star_shell_fraction(r, rs));
+    }
+    return M;
+}
+
+/**
+ * @brief Evaluates the enclosed mass (Msun) for one particle at radius `r`.
+ * @details Constant source: returns M_const. Field source: the mass of all *other* particles
+ *          whose start-of-step radius lies below `r`.
+ *          - Step function (default): every particle's mass enters as a discrete jump at its radius.
+ *          - Interpolated (`--menc-interp`): each particle's mass is ramped in linearly
+ *            between its radius and the next one, giving a continuous force.
+ *          Smooth source: the PCHIP table, recentred and with the own mass smoothed out.
+ *          Split source (`--star-substeps`): the dark-matter-only PCHIP table plus the star
+ *          shells at time `src->t` (star_mass_at).
+ *
+ * @param src [in,out] Enclosed-mass source; its search hint is updated.
+ * @param r   [in] Current radius of the particle (kpc).
+ * @return double Enclosed mass (Msun).
+ */
+static inline double menc_at(MencSource *src, double r)
+{
+    if (!src->use_field)
+        return src->M_const;
+
+    const MencFieldEntry *fld = src->field;
+    const int n = src->npts;
+    int k = menc_lower_bound(fld, n, r, src->hint);
+    src->hint = k;
+
+    if (src->use_field >= 2)
+    {
+        // Smooth PCHIP table through the knots (r_j, M_below_j): the mass of all start-of-step
+        // radii below r. The knots sit on the lower corners of the mass staircase, so the curve
+        // runs ~half a particle mass below it; adding half_m recentres it. The particle's own
+        // mass is then removed by a C1 smoothstep centred on its start radius (exact exclusion
+        // would be a jump of self_mass there).
+        double val;
+        if (k == 0)
+            val = 0.0;
+        else if (k == n)
+            val = fld[n - 1].M_below + fld[n - 1].half_m;
+        else
+        {
+            const MencFieldEntry *a = &fld[k - 1];
+            const MencFieldEntry *b = &fld[k];
+            double h = b->r - a->r;
+            double t = (r - a->r) / h;
+            double t2 = t * t, t3 = t2 * t;
+            // The recentring offset is blended between the knot values with a C1 smoothstep, so it
+            // is continuous across knots even when the mean particle mass changes between
+            // intervals. Over the first interval it ramps in from 0, so the field stays
+            // continuous at the innermost knot, where it meets M = 0.
+            double sstep = t2 * (3.0 - 2.0 * t);
+            double offset = (k == 1) ? b->half_m * sstep
+                                     : a->half_m + (b->half_m - a->half_m) * sstep;
+            val = (2.0 * t3 - 3.0 * t2 + 1.0) * a->M_below
+                + (t3 - 2.0 * t2 + t) * h * a->slope
+                + (-2.0 * t3 + 3.0 * t2) * b->M_below
+                + (t3 - t2) * h * b->slope
+                + offset;
+        }
+
+        double self;
+        if (src->self_w <= 0.0)
+            self = (r > src->self_r0) ? 1.0 : 0.0;
+        else
+        {
+            double u = (r - src->self_r0) / src->self_w + 0.5;
+            self = (u <= 0.0) ? 0.0 : (u >= 1.0) ? 1.0 : u * u * (3.0 - 2.0 * u);
+        }
+        val -= src->self_mass * self;
+        if (src->use_field == 3)
+        {
+            // --star-substeps: the table holds the dark matter only; add the star shells at the
+            // time of this force evaluation.
+            if (val < 0.0)
+                val = 0.0;
+            val += star_mass_at(src->stars, r, src->t, src->self_star, &src->star_hint_hi, &src->star_hint_lo);
+        }
+        return (val > 0.0) ? val : 0.0;
+    }
+
+    double M;
+    if (!src->interp)
+    {
+        M = (k < n) ? fld[k].M_below : src->M_total;
+        if (src->self_idx < k)
+            M -= src->self_mass;
+    }
+    else
+    {
+        if (k == 0)
+            return 0.0;
+
+        if (k == n)
+        {
+            // Beyond the outermost radius: every other particle is enclosed.
+            M = src->M_total - src->self_mass;
+        }
+        else
+        {
+            // Particle j = k-1 is the outermost one below r; its mass is ramped in over
+            // (fld[j].r, fld[j+1].r], which contains r, so the ramp is in (0, mass_j].
+            int j = k - 1;
+            double ramp = fld[j].slope * (r - fld[j].r);
+            M = fld[j].M_below + ramp;
+
+            if (src->self_idx < j)
+                M -= src->self_mass;
+            else if (src->self_idx == j)
+                M -= ramp;
+        }
+    }
+    return (M > 0.0) ? M : 0.0;
+}
+
+// =============================================================================
+// CHANDRASEKHAR DYNAMICAL FRICTION (--drag)
+// =============================================================================
+// drag_force() is taken from the "merged 041026" version (its calculate_rho() density was replaced by
+// the smooth dark-matter table). The surrounding support differs for performance: the
+// integrators only evaluate drag for particles that feel it (species != 0, see DragSource), the
+// snapshots are filled only where drag_force() reads them, and dark matter skips the per-kick
+// exp() entirely.
+
+/**
+ * @brief Computes the dynamical friction (Chandrasekhar drag) a particle feels due to
+ *        the local density of surrounding particles.
+ *
+ * @details Takes the local dark-matter density from `rho_snapshot`, the mean squared speed of the
+ *          star's DRAG_SIGMA_NEIGHBOURS nearest dark-matter rank neighbours from `vdm_sq_snapshot`
+ *          (sigma_1D^2 = <v^2>/3) and the maximum impact parameter from `bmax_snapshot`, all frozen
+ *          at the start of the step (see build_drag_snapshots), then applies the standard
+ *          Chandrasekhar dynamical friction formula (Binney & Tremaine eq. 8.7) to get the
+ *          deceleration magnitude, returned as a damping rate: v -> v * exp(-k * dt).
+ *          The Coulomb logarithm is ln Lambda = 1/2 ln(1 + Lambda^2), Lambda = b_max / b_90 with
+ *          b_90 = G m / v^2 at the star's current speed (B&T eq. 8.1 without the approximation
+ *          Lambda >> 1; b_max as in Petts, Gualandris & Read 2015). It falls to zero where b_max
+ *          shrinks to b_90, i.e. where the star's own mass rivals the mass inside its orbit, and is
+ *          smaller for heavier stars at the same place.
+ *          Returns zero for species 0 (CDM), for invalid radii, for vanishing dispersion and for
+ *          vanishing speed.
+ *
+ * @param r               [in] Radial position (kpc).
+ * @param v_rad           [in] Radial velocity (kpc/Myr).
+ * @param current_rank    [in] Particle rank (0 to npts-1), used to index `particles` and the snapshots.
+ * @param ell             [in] Angular momentum per unit mass (kpc\f$^2\f$/Myr).
+ * @param particles       [in] Particle data array (rows: position, radial velocity,
+ *                           angular momentum, ..., 7 = species, 8 = mass).
+ * @param rho_snapshot    [in] Snapshot of local dark-matter density (Msun/kpc^3).
+ * @param vdm_sq_snapshot [in] Snapshot of the neighbouring dark matter's mean squared speed (kpc^2/Myr^2).
+ * @param bmax_snapshot   [in] Snapshot of the maximum impact parameter (kpc).
+ * @param G_value         [in] Gravitational constant value (e.g., G_CONST).
+ * @param k_drag_out      [out] Drag rate k (1/Myr).
+ */
+static inline void drag_force(double r, double v_rad,
+    int current_rank,
+    double ell,
+    double** particles,
+    const double* rho_snapshot, const double* vdm_sq_snapshot, const double* bmax_snapshot,
+    double G_value,
+    double* k_drag_out)
+{
+
+    if (!g_enable_drag_force)
+    {
+        *k_drag_out = 0.0;
+        return;
+    }
+    if (particles[7][current_rank] == 0) // Drag force does not act on species 0 (CDM)
+    {
+        *k_drag_out = 0.0;
+        return;
+    }
+    if (!isfinite(r) || r <= 0.0)
+    {
+        *k_drag_out = 0.0;
+        return;
+    }
+
+    double rho_enc = rho_snapshot[current_rank];
+    double X_squared_mean = vdm_sq_snapshot[current_rank]; // mean over the dark-matter neighbours only
+    if (!(X_squared_mean > 1e-30)) {
+        *k_drag_out = 0.0;
+        return;
+    }
+
+    double v = sqrt(v_rad * v_rad + ell * ell / (r * r));
+    if (v < 1e-15) {
+        *k_drag_out = 0.0;
+        return;
+    }
+
+    double sigma_local = sqrt(2 * X_squared_mean / 3);
+    double X_vel = v / sigma_local;
+
+    // Variable Coulomb logarithm: Lambda = b_max / b_90, b_90 = G m / v^2.
+    double m_star = particles[8][current_rank];
+    double Lambda = bmax_snapshot[current_rank] * v * v / (VEL_CONV_SQ * G_value * m_star);
+    double ln_lambda = 0.5 * log1p(Lambda * Lambda);
+    // --drag-softening: the star-DM pair is a spline-softened point mass (support h = 2.8 eps), and ln Lambda is
+    // the momentum-transfer cross-section of --star-dm-rutherford's softened table in units of 4 pi b_90^2,
+    // ln Lambda = sigma_T(b_90, b_max, h) / (4 pi b_90^2). It equals the expression above for h -> 0 and drops
+    // the impact parameters below ~h; the table is built at startup (not thread-safe to build lazily here).
+    if (g_drag_softening_pc > 0.0)
+    {
+        double b90 = VEL_CONV_SQ * G_value * m_star / (v * v);
+        double h = STAR_SOFT_KERNEL * g_drag_softening_pc * 1.0e-3;
+        ln_lambda = rutherford_sigma_T(b90, bmax_snapshot[current_rank], h) / (4.0 * PI * b90 * b90);
+    }
+
+    double eps = 1e-2 * sigma_local;    // TODO: check that physics is independent of eps
+    double v_inv = v / (v * v + eps * eps); // regularization for good behavior at low velocities
+
+    double dispersive_component = erf(X_vel) - (2 / sqrt(PI)) * X_vel * exp(-1 * X_vel * X_vel);
+    double drag_total = 4 * PI * VEL_CONV_SQ * VEL_CONV_SQ * G_value * G_value * m_star * rho_enc * ln_lambda * v_inv * v_inv * dispersive_component; // See eq 8.7 in Binney & Tremaine
+
+    *k_drag_out = drag_total * v_inv; // vf = vi * exp(-k * dt) due to the dynamic drag.
+
+}
+
+/**
+ * @brief Everything drag_force() needs for one particle during one timestep.
+ * @details The integrators take a pointer to this; NULL means the particle feels no drag (dark
+ *          matter, or --drag off), in which case they run exactly the drag-free arithmetic and
+ *          return the angular momentum unchanged. All arrays are read-only during integration.
+ */
+typedef struct {
+    int rank;                      ///< Particle's start-of-step rank (index into particles and snapshots).
+    double **particles;            ///< Particle array (species and mass rows are read).
+    const double *rho_snapshot;    ///< Frozen per-step local DM density.
+    const double *vdm_sq_snapshot; ///< Frozen per-step mean squared speed of the neighbouring DM.
+    const double *bmax_snapshot;   ///< Frozen per-step maximum impact parameter.
+    double G_value;                ///< Gravitational constant (G_CONST).
+} DragSource;
+
+/// Drag rate k (1/Myr) for the particle described by `d` at state (r, v_rad, ell); see drag_force().
+static inline double drag_rate(const DragSource *d, double r, double v_rad, double ell)
+{
+    double k_drag;
+    drag_force(r, v_rad, d->rank, ell, d->particles, d->rho_snapshot, d->vdm_sq_snapshot,
+               d->bmax_snapshot, d->G_value, &k_drag);
+    return k_drag;
+}
+
+/**
+ * @brief Records, at the end of a step, each star's drag energy loss and its start-of-step heating window.
+ * @details Called after the integration loop, while the particle arrays are still in this step's
+ *          (start-of-step) rank order. For every star (species != 0) whose drag removed energy, it
+ *          stores the star's ID, the energy (drag_dE_rank) and the IDs of the dark-matter particles
+ *          (species 0) among the ranks [i - DRAG_REHEATING_BUFFER, i + DRAG_REHEATING_BUFFER]. IDs, not
+ *          indices, because the next sort reorders the arrays. The deposit itself happens in
+ *          apply_drag_reheating once that sort has produced the end-of-step neighbours.
+ *          One serial O(N) pass over the species row, plus O(window) per star.
+ *
+ * @param particles [in] Particle array in this step's rank order (rows 3, 7 are read).
+ * @param npts      [in] Number of particles.
+ */
+static void record_drag_reheating(double **particles, int npts)
+{
+    const int W = 2 * DRAG_REHEATING_BUFFER + 1;
+    g_reheat_n = 0;
+    for (int i = 0; i < npts; i++)
+    {
+        if (particles[7][i] == 0 || !(drag_dE_rank[i] > 0.0))
+            continue;
+        int k = g_reheat_n++;
+        g_reheat_star_id[k] = (int)particles[3][i];
+        g_reheat_dE[k] = drag_dE_rank[i];
+        int lo = i - DRAG_REHEATING_BUFFER < 0 ? 0 : i - DRAG_REHEATING_BUFFER;
+        int hi = i + DRAG_REHEATING_BUFFER > npts - 1 ? npts - 1 : i + DRAG_REHEATING_BUFFER;
+        int n = 0;
+        for (int q = lo; q <= hi; q++)
+            if (particles[7][q] == 0)
+                g_reheat_start_ids[(size_t)k * W + n++] = (int)particles[3][q];
+        g_reheat_nstart[k] = n;
+    }
+}
+
+/** @brief splitmix64 step: deterministic 64-bit generator for the random-direction kicks. */
+static inline uint64_t reheat_rng_next(void)
+{
+    uint64_t z = (g_reheat_rng += 0x9E3779B97F4A7C15ULL);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+}
+
+/**
+ * @brief Adds an energy dE (Msun kpc^2/Myr^2) to one dark-matter particle's kinetic energy.
+ * @details Default: scales v_r and L by the same factor f = sqrt(1 + dE/KE), which keeps the
+ *          direction of its velocity. A particle at rest receives the energy as outward radial
+ *          velocity.
+ *          --drag-random-deposit: a kick a*n along a random 3D direction n (isotropic, from a
+ *          deterministic generator), with a > 0 solving 1/2 m (|v + a n|^2 - |v|^2) = dE exactly.
+ *          The velocity is (v_r, v_t, 0) in the local (radial, tangential, normal) frame with
+ *          v_t = |L|/r; after the kick v_r' = v_r + a n_r and |L'| = r |(v_t + a n_1, a n_2)|, with
+ *          the sign of L kept. Unlike scaling, a kick can lower L, as real encounters do.
+ *          Either way no radius changes, so the sorted order stays valid.
+ */
+static inline void drag_heat_particle(double **particles, int idx, double dE)
+{
+    double m = particles[8][idx];
+    double r = particles[0][idx];
+    double vr = particles[1][idx];
+    double ell = particles[2][idx];
+    if (g_drag_random_deposit)
+    {
+        double u1 = (double)(reheat_rng_next() >> 11) * 0x1.0p-53;
+        double u2 = (double)(reheat_rng_next() >> 11) * 0x1.0p-53;
+        double nr = 2.0 * u1 - 1.0;                 // uniform direction on the sphere
+        double ph = 2.0 * PI * u2;
+        double st = sqrt(1.0 - nr * nr);
+        double n1 = st * cos(ph), n2 = st * sin(ph);
+        double vt = fabs(ell) / r;
+        double vn = vr * nr + vt * n1;              // v . n
+        double a = -vn + sqrt(vn * vn + 2.0 * dE / m);
+        double vt1 = vt + a * n1, vt2 = a * n2;
+        particles[1][idx] = vr + a * nr;
+        particles[2][idx] = (ell < 0.0 ? -1.0 : 1.0) * r * sqrt(vt1 * vt1 + vt2 * vt2);
+        return;
+    }
+    double ke = 0.5 * m * (vr * vr + ell * ell / (r * r));
+    if (ke > 0.0)
+    {
+        double f = sqrt(1.0 + dE / ke);
+        particles[1][idx] = vr * f;
+        particles[2][idx] = ell * f;
+    }
+    else
+    {
+        particles[1][idx] = sqrt(2.0 * dE / m);
+    }
+}
+
+/**
+ * @brief Deposits the energy drag removed from the stars during the last step into nearby dark matter.
+ * @details Called right after the sort at the start of the next step (and its ID-to-rank map),
+ *          before anything reads velocities (SIDM, drag snapshots, integration). For each pending
+ *          deposit, the heating set is the start-of-step window recorded by record_drag_reheating
+ *          plus the dark matter among the ranks [i - DRAG_REHEATING_BUFFER, i + DRAG_REHEATING_BUFFER]
+ *          around the star's new rank i (its end-of-step neighbours). The energy is split evenly over
+ *          all entries of both lists, so a particle on both receives two shares; this treats the start
+ *          and end of the step symmetrically. Only dark matter (species 0) is heated, only by
+ *          energy taken from stars. Serial, O(stars x window) per step.
+ *
+ * @param particles   [in,out] Radius-sorted particle array; DM v_r and L (rows 1, 2) are raised.
+ * @param npts        [in] Number of particles.
+ * @param inverse_map [in] Particle ID -> current rank.
+ */
+static void apply_drag_reheating(double **particles, int npts, const int *inverse_map)
+{
+    const int W = 2 * DRAG_REHEATING_BUFFER + 1;
+    for (int k = 0; k < g_reheat_n; k++)
+    {
+        int i = inverse_map[g_reheat_star_id[k]];
+        int lo = i - DRAG_REHEATING_BUFFER < 0 ? 0 : i - DRAG_REHEATING_BUFFER;
+        int hi = i + DRAG_REHEATING_BUFFER > npts - 1 ? npts - 1 : i + DRAG_REHEATING_BUFFER;
+        int n_end = 0;
+        for (int q = lo; q <= hi; q++)
+            if (particles[7][q] == 0) n_end++;
+        int n_total = g_reheat_nstart[k] + n_end;
+        if (n_total == 0)
+            continue;
+        double share = g_reheat_dE[k] / n_total;
+        const int *ids = g_reheat_start_ids + (size_t)k * W;
+        for (int a = 0; a < g_reheat_nstart[k]; a++)
+            drag_heat_particle(particles, inverse_map[ids[a]], share);
+        for (int q = lo; q <= hi; q++)
+            if (particles[7][q] == 0)
+                drag_heat_particle(particles, q, share);
+    }
+    g_reheat_n = 0;
+}
+
+// Dark-matter-only smooth M(r) table (defined with the --star-substeps code below); with --drag it
+// is rebuilt every step and gives the local dark-matter density for drag_force().
+#define DRAG_DENSITY_KNOTS 64          ///< Knot spacing of the dark-matter table when --menc-smooth is not given.
+static int *g_dm_idx_of_rank;
+static MencFieldEntry *g_dm_tab;
+static int g_dm_nk;
+static int g_dm_table_k;
+
+/**
+ * @brief Local dark-matter density (Msun/kpc^3) at radius r from the dark-matter-only smooth table.
+ * @details rho = (dM_DM/dr) / (4 pi r^2), with dM/dr the derivative of the monotone PCHIP interpolant
+ *          through the knots (the small blended recentring offset of menc_at is left out). The knots
+ *          are spaced by up to K dark-matter particles, so the estimate averages over ~K particles and,
+ *          unlike calculate_rho's 11-rank window, has no small-number bias.
+ *
+ * @param r      [in] Radius (kpc).
+ * @param dm_idx [in] Number of dark-matter particles below r at the start of the step (search hint).
+ */
+static inline double dm_table_density(double r, int dm_idx)
+{
+    const int n = g_dm_nk;
+    if (n < 2 || !(r > 0.0))
+        return 0.0;
+    int k = menc_lower_bound(g_dm_tab, n, r, dm_idx / g_dm_table_k);
+    double dMdr;
+    if (k == 0)
+        dMdr = g_dm_tab[0].slope;
+    else if (k == n)
+        dMdr = 0.0;
+    else
+    {
+        const MencFieldEntry *a = &g_dm_tab[k - 1];
+        const MencFieldEntry *b = &g_dm_tab[k];
+        double h = b->r - a->r;
+        double t = (r - a->r) / h;
+        double t2 = t * t;
+        dMdr = ((6.0 * t2 - 6.0 * t) * a->M_below + (-6.0 * t2 + 6.0 * t) * b->M_below) / h
+             + (3.0 * t2 - 4.0 * t + 1.0) * a->slope + (3.0 * t2 - 2.0 * t) * b->slope;
+    }
+    return (dMdr > 0.0) ? dMdr / (4.0 * PI * r * r) : 0.0;
+}
+
+/**
+ * @brief Dark-matter mass (Msun) inside radius r from the dark-matter-only smooth table.
+ * @details The monotone PCHIP interpolant through the knots (without menc_at's small recentring
+ *          offset, which cancels in the shell differences of drag_bmax).
+ *
+ * @param r    [in] Radius (kpc).
+ * @param hint [in] Search hint into the knot table.
+ */
+static inline double dm_table_mass(double r, int hint)
+{
+    const int n = g_dm_nk;
+    if (n < 1 || !(r > g_dm_tab[0].r))
+        return 0.0;
+    int k = menc_lower_bound(g_dm_tab, n, r, hint);
+    if (k >= n)
+        return g_dm_tab[n - 1].M_below;
+    const MencFieldEntry *a = &g_dm_tab[k - 1];
+    const MencFieldEntry *b = &g_dm_tab[k];
+    double h = b->r - a->r;
+    double t = (r - a->r) / h;
+    double t2 = t * t, t3 = t2 * t;
+    return (2.0 * t3 - 3.0 * t2 + 1.0) * a->M_below + (t3 - 2.0 * t2 + t) * h * a->slope
+         + (-2.0 * t3 + 3.0 * t2) * b->M_below + (t3 - t2) * h * b->slope;
+}
+
+/**
+ * @brief Maximum impact parameter for the Coulomb logarithm, b_max = min(r, rho/|drho/dr|) (kpc).
+ * @details Petts, Gualandris & Read (2015). The density scale length comes from the logarithmic
+ *          slope gamma = dln(rho)/dln(r) between the mean dark-matter densities of the shells
+ *          [r/f, r] and [r, r f] (f = DRAG_BMAX_SHELL_FACTOR): for rho ~ r^gamma their ratio is
+ *          exactly f^gamma, so gamma = ln(rho_out/rho_in)/ln f and rho/|drho/dr| = r/|gamma|.
+ *          Each shell holds many more particles than a knot interval, so the slope is not
+ *          dominated by particle noise. Falls back to b_max = r if either shell is empty.
+ *
+ * @param r      [in] Radius (kpc).
+ * @param dm_idx [in] Number of dark-matter particles below r (search hint).
+ */
+static inline double drag_bmax(double r, int dm_idx)
+{
+    const double f = DRAG_BMAX_SHELL_FACTOR;
+    int hint = dm_idx / g_dm_table_k;
+    double m_in = dm_table_mass(r / f, hint);
+    double m_mid = dm_table_mass(r, hint);
+    double m_out = dm_table_mass(r * f, hint);
+    double f3 = f * f * f;
+    double rho_in = (m_mid - m_in) / (1.0 - 1.0 / f3);  // common factor 4 pi r^3 / 3 dropped
+    double rho_out = (m_out - m_mid) / (f3 - 1.0);
+    if (!(rho_in > 0.0) || !(rho_out > 0.0))
+        return r;
+    double gamma = fabs(log(rho_out / rho_in) / log(f));
+    return (gamma > 1.0) ? r / gamma : r;
+}
+
+/**
+ * @brief Fills the drag snapshots for the current (radius-sorted) particle order.
+ * @details v_sq_snapshot and dm_menc_snapshot are filled for every rank (cheap passes);
+ *          rho_snapshot and lmin_snapshot only at ranks holding a particle that feels drag
+ *          (species != 0), the only entries that are read. rho_snapshot is the local dark-matter
+ *          density from the dark-matter-only smooth M(r) table (dm_table_density), which must have
+ *          been rebuilt for this step's order. vdm_sq_snapshot is the mean squared speed of the
+ *          DRAG_SIGMA_NEIGHBOURS dark-matter particles nearest the star in rank (taken alternately
+ *          outward and inward, so one-sided at the array ends), and bmax_snapshot the Coulomb
+ *          logarithm's maximum impact parameter (drag_bmax), both at star ranks only.
+ *
+ *          lmin_snapshot is the drag floor on |L|: the circular-orbit angular momentum at the
+ *          star's influence radius r_infl, where the enclosed dark-matter mass equals the star's
+ *          mass, L_min = sqrt(G M_DM(<r_infl) r_infl) = sqrt(G m_star r_infl). At pericentre the
+ *          speed is at least the circular speed, so L >= L_circ(r_peri); L_circ grows with r, so
+ *          |L| < L_min means the orbit's pericentre lies inside r_infl, where the star dominates
+ *          the local mass and the Chandrasekhar formula does not apply.
+ *
+ * @param particles [in] Radius-sorted particle array (rows 0-2 and 7-8 are read).
+ * @param npts      [in] Number of particles.
+ */
+static void build_drag_snapshots(double **particles, int npts)
+{
+#pragma omp parallel for schedule(static)
+    for (int k = 0; k < npts; k++)
+    {
+        double rk = particles[0][k];
+        double vradk = particles[1][k];
+        double ellk = particles[2][k];
+        v_sq_snapshot[k] = vradk * vradk + ellk * ellk / (rk * rk);
+        if (particles[7][k] != 0)
+            rho_snapshot[k] = dm_table_density(particles[0][k], g_dm_idx_of_rank[k]);
+    }
+
+    // Dark-matter mass at lower ranks (serial prefix over the sorted order; ~1 ms per step)
+    double m_dm = 0.0;
+    for (int k = 0; k < npts; k++)
+    {
+        dm_menc_snapshot[k] = m_dm;
+        if (particles[7][k] == 0)
+            m_dm += particles[8][k];
+    }
+
+    // Drag floor on |L| per star: binary search for the first rank whose DM mass below reaches
+    // the star's mass (its influence radius); a few hundred O(log N) searches per step. The same
+    // pass fills the stars' neighbour dispersion and b_max, after v_sq_snapshot is complete.
+    for (int k = 0; k < npts; k++)
+    {
+        if (particles[7][k] == 0)
+            continue;
+        double m_star = particles[8][k];
+        int lo = 0, hi = npts - 1;
+        while (lo < hi)
+        {
+            int mid = lo + (hi - lo) / 2;
+            if (dm_menc_snapshot[mid] >= m_star) hi = mid; else lo = mid + 1;
+        }
+        double r_infl = particles[0][lo];
+        lmin_snapshot[k] = sqrt((VEL_CONV_SQ * G_CONST) * m_star * r_infl);
+
+        // Mean squared speed of the nearest dark-matter neighbours in rank, alternating outward
+        // and inward (other stars are skipped).
+        int q_hi = k + 1, q_lo = k - 1, n_dm = 0, outward = 1;
+        double vsq_sum = 0.0;
+        while (n_dm < DRAG_SIGMA_NEIGHBOURS && (q_hi < npts || q_lo >= 0))
+        {
+            int q = ((outward && q_hi < npts) || q_lo < 0) ? q_hi++ : q_lo--;
+            outward = !outward;
+            if (particles[7][q] == 0)
+            {
+                vsq_sum += v_sq_snapshot[q];
+                n_dm++;
+            }
+        }
+        vdm_sq_snapshot[k] = (n_dm > 0) ? vsq_sum / n_dm : 0.0;
+        bmax_snapshot[k] = drag_bmax(particles[0][k], g_dm_idx_of_rank[k]);
+    }
 }
 
 /**
@@ -1816,7 +2998,7 @@ static double *g_total_E = NULL;        ///< Total energy (KE + PE) of the syste
 static int g_energy_snapshots_loaded = 0; ///< Number of energy snapshots loaded from existing file in restart mode.
 
 // Forward declaration of energy calculation function
-static void calculate_system_energies(double** particles, int npts, double deltaM,
+static void calculate_system_energies(double** particles, int npts,
                                       double* total_KE_out, double* total_PE_out);
 
 /**
@@ -2141,10 +3323,9 @@ int double_cmp(const void *a, const void *b)
 int compare_particles(const void *a, const void *b);
 
 void sort_particles(double **particles, int npts);
+static void rebuild_mass_prefix_sum(double **particles, int npts);
 
 void sort_particles_with_alg(double **particles, int npts, const char *sortAlg);
-
-static void rebuild_mass_prefix_sum(double **particles, int npts);
 
 #if defined(__APPLE__) && defined(GPU_SORT_AVAILABLE)
 /// Sort particles by radius using GPU radix sort (Metal).
@@ -2179,8 +3360,6 @@ double drhodr_om_hernquist(double r, double a_scale, double M_total);
 double drhodr(double r);
 double density_derivative_om_cored(double r);
 double density_derivative_om_nfw(double r, double rc_param, double nt_nfw_scaler, double falloff_C_param);
-static void initialize_particle_masses(double **particles, int npts);
-
 
 // Forward declarations
 double Psiintegrand(double rp, void *params);
@@ -2334,8 +3513,12 @@ static void printUsage(const char *prog)
             "  --tfinal <int>                [Default 5] Final simulation time in units of the dynamical time\n"
             "  --lvals-target <float>        [Default Off] Output L values with values closest to target\n"
             "\n"
-            "  --readinit <file>             [Default Off] Read initial conditions from <file> (binary)\n"
-            "  --writeinit <file>            [Default Off] Write initial conditions to <file> (binary)\n"
+            "  --readinit <file>             [Default Off] Read initial conditions from init/<file> (binary).\n"
+            "                                     Accepts 9 doubles per particle (r, v, L, ID, mu, cos_phi,\n"
+            "                                     sin_phi, species, mass), 10 (+ reserved) or legacy 7\n"
+            "                                     (species 0, mass = halo mass / nparticles).\n"
+            "  --writeinit <file>            [Default Off] Write initial conditions to init/<file> (binary,\n"
+            "                                     9 doubles per particle incl. species and mass)\n"
             "  --master-seed <int>           [Default Random] Set a master seed to derive other seeds.\n"
             "  --load-seeds                  [Default Off] Load seeds from previous run's output files\n"
             "  --init-cond-seed <int>        [Default Random/Master] Set seed for IC generation.\n"
@@ -2352,6 +3535,82 @@ static void printUsage(const char *prog)
             "                                          8   Classic RK4\n"
             "                                          9   Euler\n"
             "  --methodtag                   [Default Off] Include method string in output filenames\n"
+            "  --menc-field                  [Default Off] For --method 1: evaluate the enclosed mass at each\n"
+            "                                     particle's current radius from the start-of-step radius\n"
+            "                                     distribution (removes rank-lag heating).\n"
+            "  --menc-interp                 [Default Off] With --menc-field: interpolate M(r) linearly between\n"
+            "                                     radii. Default is a step function at each particle radius.\n"
+            "  --drag                        [Default Off] For --method 1: Chandrasekhar dynamical friction on every\n"
+            "                                     particle of species != 0 (stars): local dark-matter density from\n"
+            "                                     the smooth dark-matter M(r) table, velocity dispersion of its\n"
+            "                                     64 nearest dark-matter rank neighbours, and\n"
+            "                                     ln Lambda = 1/2 ln(1 + (b_max v^2/G m)^2) with\n"
+            "                                     b_max = min(r, rho/|drho/dr|).\n"
+            "                                     Damps both v_r and L unless --drag-no-radial is given. Off for a\n"
+            "                                     star while the DM mass inside it is below its own mass, or while\n"
+            "                                     |L| < L_circ at the radius enclosing its own mass in DM.\n"
+            "                                     The energy removed is deposited evenly into the dark matter\n"
+            "                                     within +-DRAG_REHEATING_BUFFER (1024) ranks of the star at the\n"
+            "                                     start and end of each step.\n"
+            "  --drag-no-radial              [Default Off] With --drag: apply the drag to L only, not to v_r.\n"
+            "  --drag-softening <pc>         [Default 0 = off] With --drag: star-DM softening length eps in the\n"
+            "                                     Coulomb logarithm, ln Lambda = sigma_T / (4 pi b_90^2) with the\n"
+            "                                     softened cross-section of --star-dm-rutherford (support 2.8 eps).\n"
+            "  --drag-random-deposit         [Default Off] With --drag: give the drag energy to the dark matter as\n"
+            "                                     kicks in random directions (can lower L) instead of scaling\n"
+            "                                     each particle's velocity (always raises L).\n"
+            "  --star-dm-rutherford          [Default Off] For --method 1, instead of --drag: every star\n"
+            "                                     (species != 0) scatters elastically off its nearest\n"
+            "                                     dark-matter rank neighbours with the gravitational (Rutherford)\n"
+            "                                     momentum-transfer cross-section 4 pi b_90^2 ln Lambda, b_90 =\n"
+            "                                     G (m_star + m_DM)/v_rel^2, b_max as for --drag; the cumulative\n"
+            "                                     small-angle deflection per step follows Nanbu (1997). Conserves\n"
+            "                                     energy and momentum; uses the SIDM seed. Stars are excluded\n"
+            "                                     from --sidm scattering.\n"
+            "  --star-dm-neighbours <int>    [Default 10] With --star-dm-rutherford: dark-matter rank neighbours\n"
+            "                                     each star scatters off per step. More neighbours lower each pair's\n"
+            "                                     s = n sigma_T v_rel dt and so its saturation (1 - e^-s < s).\n"
+            "  --star-dm-softening <pc>      [Default 1e-5] With --star-dm-rutherford: star-DM softening length eps\n"
+            "                                     (Errani et al. 2026's eps_DM, spline kernel, Newtonian beyond\n"
+            "                                     2.8 eps). Impact parameters below 2.8 eps deflect less, lowering\n"
+            "                                     sigma_T. 0 = point masses.\n"
+            "  --star-dm-bmax-floor <pc>     [Default 0 = off] With --star-dm-rutherford: lower bound on b_max,\n"
+            "                                     which otherwise shrinks to r near the centre. Keeps\n"
+            "                                     ln(b_max / 2.8 eps) from vanishing for stars inside the core.\n"
+            "  --star-star-rutherford       [Default Off] For --method 1: once per step, stars of all species\n"
+            "                                     1-9 scatter elastically off each other (any species pair) with\n"
+            "                                     the Rutherford cross-section of --star-dm-rutherford, b_90 =\n"
+            "                                     G (m_a + m_b)/v_rel^2, and Nanbu's cumulative angle. Each star\n"
+            "                                     pairs with its <k> nearest star rank neighbours on each side\n"
+            "                                     (--star-star-neighbours); the star density is 1/V per partner\n"
+            "                                     over the shell they span. Every pair is visited from both stars,\n"
+            "                                     each visit with half the rate. Any species may be present; stars\n"
+            "                                     of other species (10+) take no part. Can combine with --drag,\n"
+            "                                     --star-dm-rutherford, --sidm.\n"
+            "  --star-star-neighbours <int>  [Default 10] With --star-star-rutherford: star rank neighbours on\n"
+            "                                     each side of a star (the density kernel and partner window).\n"
+            "  --menc-smooth <int>           [Default Off] For --method 1: smooth monotone M(r) (PCHIP) shared by\n"
+            "                                     all particles, with knots every <int> particles. Treats\n"
+            "                                     the mass as a smooth mean field; cannot combine with --menc-field.\n"
+            "  --star-substeps <int>         [Default 32 when the run has stars, --method 1 and --menc-smooth;\n"
+            "                                     0 = off] The smooth table holds the dark matter only; the stars\n"
+            "                                     (species != 0) are integrated first in <int> sub-steps per step\n"
+            "                                     and enter M(r) as discrete shells at radii interpolated in time\n"
+            "                                     (softened over r(1 +- 1e-3) for the dark matter).\n"
+            "  --star-substep-method <int>   [Default 1] With --star-substeps: 1 = each star advances in every\n"
+            "                                     sub-step with the other stars frozen at its start; 2 = as 1,\n"
+            "                                     then stars whose radial sweeps overlap in the sub-step (within\n"
+            "                                     the star-star softening support) are re-integrated jointly as\n"
+            "                                     clusters in physical time, each feeling the others' current\n"
+            "                                     radii. Grown clusters are redone at most 10 times per sub-step;\n"
+            "                                     a member flipping through r = 0 forces finer steps (logged).\n"
+            "                                     3 = as 2, but clusters with a Levi-Civita member are integrated\n"
+            "                                     jointly in a shared Levi-Civita (regularised) time.\n"
+            "  --star-softening <pc>         [Default 1e-5] Star-star softening length eps (spline kernel;\n"
+            "                                     Errani et al. 2026 use 0.02). With --star-substeps, star pairs\n"
+            "                                     closer than 2.8 eps in radius interact softly in the mean field;\n"
+            "                                     with --star-star-rutherford it softens the collision\n"
+            "                                     cross-section. 0 = sharp shells, point masses.\n"
             "  --sort <int>                  [Default 1] Sorting algorithm (1..6):\n"
             "                                          1   Parallel Quadsort\n"
             "                                          2   Sequential Quadsort\n"
@@ -2375,6 +3634,8 @@ static void printUsage(const char *prog)
             "  --sidm                        [Default Off] Enable self-interacting scattering physics\n"
             "  --sidm-seed <int>             [Default Random/Master] Set seed for SIDM calculations.\n"
             "                                     Overrides derivation from master-seed.\n"
+            "  --star-star-seed <int>        [Default Random/Master] Seed for --star-star-rutherford\n"
+            "                                     (master seed + 3 when only --master-seed is given).\n"
             "  --sidm-mode <serial|parallel> [Default parallel] Select SIDM execution mode.\n"
             "                                     Parallel mode requires OpenMP.\n"
             "  --sidm-kappa <float>          [Default 50.0] SIDM opacity kappa in cm^2/g.\n"
@@ -2476,7 +3737,7 @@ void sort_by_rad(struct PartData *array, int npts);
  * @note Exits via `CLEAN_EXIT(1)` if the file cannot be opened for appending.
  */
 static void append_all_particle_data_chunk_to_file(const char *filename, int npts, int block_size,
-                                                   float *L_block, int *Rank_block, float *R_block, float *Vrad_block, int* species_block)
+                                                   float *L_block, int *Rank_block, float *R_block, float *Vrad_block)
 {
     FILE *f = fopen(filename, "ab");
     if (!f)
@@ -2494,14 +3755,12 @@ static void append_all_particle_data_chunk_to_file(const char *filename, int npt
             float rval = R_block[step * npts + i];
             float vval = Vrad_block[step * npts + i];
             float lval = L_block[step * npts + i];
-            int   spval = species_block[step * npts + i];
 
             // Write particle data in fixed order
             fwrite(&rankval, sizeof(int), 1, f);
             fwrite(&rval, sizeof(float), 1, f);
             fwrite(&vval, sizeof(float), 1, f);
             fwrite(&lval, sizeof(float), 1, f);
-            fwrite(&spval, sizeof(int), 1, f);
         }
     }
 
@@ -2607,35 +3866,6 @@ static void append_all_particle_ids_to_file(const char *filename, int npts, int 
         {
             int id_val = id_block[step * npts + i];
             fwrite(&id_val, sizeof(int), 1, f);
-        }
-    }
-
-    fclose(f);
-}
-
-/**
- * @brief Appends a block of particle species data to the specified output file.
- * @param filename         [in] Path to the output binary species data file.
- * @param npts             [in] Number of particles.
- * @param block_size       [in] Number of timesteps of data in `species_blk`.
- * @param species_blk      [in] Pointer to the block of species data (int array).
- */
-static void append_all_particle_species_to_file(const char* filename, int npts, int block_size,
-    int* species_blk)
-{
-    FILE* f = fopen(filename, "ab");
-    if (!f)
-    {
-        printf("Error: cannot open %s for appending all_particle_species\n", filename);
-        CLEAN_EXIT(1);
-    }
-
-    for (int step = 0; step < block_size; step++)
-    {
-        for (int i = 0; i < npts; i++)
-        {
-            int sp = species_blk[step * npts + i];
-            fwrite(&sp, sizeof(int), 1, f);
         }
     }
 
@@ -2787,7 +4017,7 @@ static void retrieve_all_particle_snapshot(
         int block_number = snap / block_size;
         int index_in_block = snap % block_size;
 
-        long long step_data_size = (long long)npts * N_BYTES_PER_RECORD; // N_BYTES_PER_RECORD bytes per record.
+        long long step_data_size = (long long)npts * 16; // 16 bytes per record.
         long long block_data_size = (long long)block_size * step_data_size;
         long long offset = block_data_size * block_number + step_data_size * index_in_block;
 
@@ -2801,14 +4031,13 @@ static void retrieve_all_particle_snapshot(
         // Read npts records into local buffers.
         for (int i = 0; i < npts; i++)
         {
-            int rankval, spval;
+            int rankval;
             float rval, vval, lval;
 
             if (fread(&rankval, sizeof(int), 1, f) != 1 ||
                 fread(&rval, sizeof(float), 1, f) != 1 ||
                 fread(&vval, sizeof(float), 1, f) != 1 ||
-                fread(&lval, sizeof(float), 1, f) != 1 ||
-                fread(&spval, sizeof(int), 1, f) != 1)
+                fread(&lval, sizeof(float), 1, f) != 1)
             {
                 fprintf(stderr, "Error: unexpected EOF while reading snap=%d (particle %d)\n", snap, i);
                 fclose(f);
@@ -2848,7 +4077,7 @@ static void retrieve_all_particle_snapshot(
  * @param npts Number of particles
  * @param block_size Block size for I/O (typically 100)
  */
-static void load_particles_from_restart(
+static void load_particles_from_restart_state(
     const char *filename,
     int snapshot_index,
     double **particles,
@@ -2879,13 +4108,37 @@ static void load_particles_from_restart(
             fseek(fp_check, 0, SEEK_END);
             long file_size = ftell(fp_check);
             fclose(fp_check);
-            total_snapshots = file_size / (npts * N_BYTES_PER_RECORD);  // N_BYTES_PER_RECORD bytes per particle per snapshot
+            total_snapshots = file_size / (npts * 16);  // 16 bytes per particle per snapshot
         }
 
         int *temp_ids = (int *)malloc(npts * sizeof(int));
         int dbl_success = load_from_double_buffer(tag, snapshot_index, total_snapshots,
                                                   particles, npts, temp_ids);
         free(temp_ids);
+
+        // The double buffer is a 4-slot ring (slot = snapshot % 4). After --sim-restart truncates the files to an
+        // earlier common snapshot, the slot may hold a later snapshot (e.g. 79 in the slot of 75), so check that
+        // the slot's radii, rounded to float, equal the float32 radii of this snapshot before trusting it.
+        if (dbl_success) {
+            FILE *fp_f = fopen(filename, "rb");
+            int match = 0;
+            if (fp_f && fseek(fp_f, (long)snapshot_index * npts * 16L, SEEK_SET) == 0) {
+                match = 1;
+                for (int i = 0; i < npts && match; i++) {
+                    unsigned char rec[16];
+                    float r_f;
+                    if (fread(rec, 1, 16, fp_f) != 16) { match = 0; break; }
+                    memcpy(&r_f, rec + 4, sizeof(float));
+                    if ((float)particles[0][i] != r_f) match = 0;
+                }
+            }
+            if (fp_f) fclose(fp_f);
+            if (!match) {
+                printf("WARNING: double-buffer slot %d does not hold snapshot %d; loading the float32 snapshot instead\n",
+                       snapshot_index % 4, snapshot_index);
+                dbl_success = 0;
+            }
+        }
 
         if (dbl_success) {
             // Need to load particle IDs to rebuild inverse_map correctly
@@ -3164,6 +4417,59 @@ static void load_particles_from_restart(
 }
 
 /**
+ * @brief Loads a snapshot for restart/extend and restores each particle's species and mass.
+ * @details Calls load_particles_from_restart_state (radius, velocity, angular momentum, ID,
+ *          phi), then fills particles[P_SPECIES] and particles[P_MASS] by particle ID from the
+ *          run's data/particle_species_mass<tag>.dat (snapshots do not store them). Falls back to
+ *          species 0 and halo_mass / npts for runs that predate the table.
+ *
+ * @param filename       Path to the all_particle_data file.
+ * @param snapshot_index Which snapshot to load (0-based).
+ * @param particles      Output particle array.
+ * @param npts           Number of particles.
+ * @param block_size     Block size for I/O.
+ * @param inverse_map    Rebuilt ID -> index map (may be NULL).
+ */
+static void load_particles_from_restart(
+    const char *filename,
+    int snapshot_index,
+    double **particles,
+    int npts,
+    int block_size,
+    int *inverse_map)
+{
+    load_particles_from_restart_state(filename, snapshot_index, particles, npts, block_size, inverse_map);
+
+    // data/all_particle_data<tag>.dat -> data/particle_species_mass<tag>.dat
+    char table_filename[600];
+    const char *pos = strstr(filename, "all_particle_data");
+    if (pos)
+        snprintf(table_filename, sizeof(table_filename), "%.*sparticle_species_mass%s",
+                 (int)(pos - filename), filename, pos + strlen("all_particle_data"));
+    else
+        snprintf(table_filename, sizeof(table_filename), "data/particle_species_mass%s.dat", g_file_suffix);
+
+    int *species_by_id = (int *)malloc((size_t)npts * sizeof(int));
+    double *mass_by_id = (double *)malloc((size_t)npts * sizeof(double));
+    if (!species_by_id || !mass_by_id)
+    {
+        fprintf(stderr, "ERROR: Failed to allocate species/mass buffers for restart\n");
+        CLEAN_EXIT(1);
+    }
+    load_species_mass_or_default(table_filename, npts, g_active_halo_mass / (double)npts, species_by_id, mass_by_id);
+    for (int i = 0; i < npts; i++)
+    {
+        int pid = (int)particles[3][i];
+        if (pid < 0 || pid >= npts)
+            pid = i;
+        particles[P_SPECIES][i] = (double)species_by_id[pid];
+        particles[P_MASS][i] = mass_by_id[pid];
+    }
+    free(species_by_id);
+    free(mass_by_id);
+}
+
+/**
  * @brief Save chosen particle IDs to a binary file.
  * @details This function saves particle IDs for multiple trajectory tracking systems to ensure
  *          continuity across restart and extend operations. It writes two sets of particle IDs:
@@ -3429,6 +4735,18 @@ int cmp_LAI(const void *a, const void *b)
 // - If within tolerance, return one of {coarse, fine, rich (Richardson extrapolation)}
 // - Otherwise, double N and repeat until convergence or max subdivision reached
 /**
+ * @brief Specific kinetic energy removed by one drag damping event (kpc^2/Myr^2).
+ * @details 0.5*[(v_r^2 - v_r'^2) + (L^2 - L'^2)/r^2] at the kick radius r. The integrators sum it
+ *          over the accepted solution (combined across coarse/fine passes like L), and the method-1
+ *          loop deposits it, times the star's mass, into the surrounding dark matter
+ *          (see record_drag_reheating / apply_drag_reheating).
+ */
+static inline double drag_ke_loss(double v_before, double v_after, double ell_before, double ell_after, double r)
+{
+    return 0.5 * ((v_before * v_before - v_after * v_after) + (ell_before * ell_before - ell_after * ell_after) / (r * r));
+}
+
+/**
  * @brief Performs a leapfrog integration step using a fixed number of micro-steps.
  * @details This helper function implements the leapfrog (Kick-Drift-Kick) integration
  *          over a total time interval `h` by dividing it into a sequence of micro-steps.
@@ -3439,8 +4757,7 @@ int cmp_LAI(const void *a, const void *b)
  *          Sequence: Initial half-kick, \f$((\text{subSteps}-1)/2 - 1)\f$ full Drift-Kick pairs,
  *          a final full Drift, and a final half-Kick.
  *
- * @param i                   [in] Particle index (0 to npts-1), for rank in gravitational force.
- * @param npts                [in] Total number of particles.
+ * @param msrc          [in,out] Enclosed-mass source (constant rank value, or the M(r) field with a per-particle search hint).
  * @param r_in                [in] Input radial position (kpc) at the start of the total interval `h`.
  * @param v_in                [in] Input radial velocity (kpc/Myr) at the start of `h`.
  * @param ell                 [in] Angular momentum per unit mass (kpc\f$^2\f$/Myr).
@@ -3448,21 +4765,31 @@ int cmp_LAI(const void *a, const void *b)
  * @param N_subdivision_factor [in] Base subdivision factor \f$N\f$ used to determine micro-timestep sizes.
  * @param subSteps            [in] Total number of Kicks/Drifts (e.g., \f$2N+1\f$ or \f$4N+1\f$).
  * @param grav                [in] Gravitational constant G (simulation units).
+ * @param drag                [in] Drag context for this particle, or NULL if it feels no drag. With
+ *                                 drag, every kick is followed by v, L *= exp(-k * kick), with k from
+ *                                 drag_force() at the pre-kick state, and a drift through r < 0 is reflected.
  * @param r_out               [out] Pointer to store the output radial position (kpc) after time `h`.
  * @param v_out               [out] Pointer to store the output radial velocity (kpc/Myr) after time `h`.
+ * @param ell_out             [out] Pointer to store the output angular momentum (kpc\f$^2\f$/Myr); equals `ell` without drag.
+ * @param edrag_out [out] Specific kinetic energy the drag removed over the step (kpc^2/Myr^2), combined
+ *                  across coarse/fine passes like L; 0 without drag.
  */
 static void doMicroLeapfrog(
-    int i, int npts,
+    MencSource *msrc,
     double r_in, double v_in, double ell,
     double h,     // Total physical time interval for this leapfrog sequence.
     int N,        // Base subdivision factor.
     int subSteps, // Total number of kicks/drifts.
     double grav,
-    double *r_out, double *v_out)
+    const DragSource *drag,
+    double *r_out, double *v_out, double *ell_out, double *edrag_out)
 {
+    (void)grav; // Gravity is evaluated via the enclosed-mass source (gravitational_force uses G_CONST)
     // Initialize current state with input values
     double r_curr = r_in;
     double v_curr = v_in;
+    double k_drag = 0.0;
+    double e_drag = 0.0; // specific kinetic energy removed by drag (kpc^2/Myr^2)
 
     // Set up timestep sizes based on subdivision level
     double halfKick, midStep;
@@ -3480,9 +4807,19 @@ static void doMicroLeapfrog(
     }
 
     // Initial half-kick (velocity update)
-    double force = gravitational_force(r_curr, i, npts, grav, g_active_halo_mass);
+    if (drag) k_drag = drag_rate(drag, r_curr, v_curr, ell);
+    msrc->t = 0.0; // time of this force evaluation since the start of h (read only by --star-substeps)
+    double force = gravitational_force(r_curr, menc_at(msrc, r_curr));
     double dvdt = force + effective_angular_force(r_curr, ell);
     v_curr += halfKick * dvdt;
+    if (drag)
+    {
+        double damp = exp(-k_drag * halfKick);
+        double v_pre = v_curr, ell_pre = ell;
+        if (!g_drag_no_radial) v_curr *= damp;
+        ell *= damp;
+        e_drag += drag_ke_loss(v_pre, v_curr, ell_pre, ell, r_curr);
+    }
 
     // Middle pattern of drift-kick pairs
     int pairs = (subSteps - 1) / 2; // Total number of drift-kick pairs
@@ -3491,23 +4828,47 @@ static void doMicroLeapfrog(
     {
         // Drift: update position using current velocity
         r_curr += midStep * v_curr;
+        if (drag && r_curr < 0.0) { r_curr = -r_curr; v_curr = -v_curr; }
 
         // Kick: update velocity using forces at new position
-        force = gravitational_force(r_curr, i, npts, grav, g_active_halo_mass);
+        if (drag) k_drag = drag_rate(drag, r_curr, v_curr, ell);
+        msrc->t = (double)pp * midStep;
+        force = gravitational_force(r_curr, menc_at(msrc, r_curr));
         dvdt = force + effective_angular_force(r_curr, ell);
         v_curr += midStep * dvdt;
+        if (drag)
+        {
+            double damp = exp(-k_drag * midStep);
+            double v_pre = v_curr, ell_pre = ell;
+            if (!g_drag_no_radial) v_curr *= damp;
+            ell *= damp;
+            e_drag += drag_ke_loss(v_pre, v_curr, ell_pre, ell, r_curr);
+        }
     }
 
     // Final full drift
     r_curr += midStep * v_curr;
+    if (drag && r_curr < 0.0) { r_curr = -r_curr; v_curr = -v_curr; }
 
     // Final half-kick
-    force = gravitational_force(r_curr, i, npts, grav, g_active_halo_mass);
+    if (drag) k_drag = drag_rate(drag, r_curr, v_curr, ell);
+    msrc->t = h;
+    force = gravitational_force(r_curr, menc_at(msrc, r_curr));
     dvdt = force + effective_angular_force(r_curr, ell);
     v_curr += halfKick * dvdt;
+    if (drag)
+    {
+        double damp = exp(-k_drag * halfKick);
+        double v_pre = v_curr, ell_pre = ell;
+        if (!g_drag_no_radial) v_curr *= damp;
+        ell *= damp;
+        e_drag += drag_ke_loss(v_pre, v_curr, ell_pre, ell, r_curr);
+    }
 
     *r_out = r_curr;
     *v_out = v_curr;
+    *ell_out = ell;
+    *edrag_out = e_drag;
 }
 
 /**
@@ -3524,24 +4885,33 @@ static void doMicroLeapfrog(
  *          (coarse, fine, or Richardson extrapolation) once convergence is met or
  *          `max_subdiv` is reached.
  *
- * @param i             [in] Particle index (0 to npts-1), for rank in gravitational force calculation.
- * @param npts          [in] Total number of particles in the simulation.
+ * @param msrc          [in,out] Enclosed-mass source (constant rank value, or the M(r) field with a per-particle search hint).
  * @param r_in          [in] Initial radial position (kpc) at the start of the step `h`.
  * @param v_in          [in] Initial radial velocity (kpc/Myr) at the start of `h`.
- * @param ell           [in] Angular momentum per unit mass (kpc\f$^2\f$/Myr), conserved.
+ * @param ell           [in] Angular momentum per unit mass (kpc\f$^2\f$/Myr), conserved unless `drag` is set.
  * @param h             [in] Full physical timestep size \f$\Delta T_{phys}\f$ (Myr).
  * @param radius_tol    [in] Relative convergence tolerance for radius comparison.
- * @param velocity_tol  [in] Relative convergence tolerance for velocity comparison.
+ * @param velocity_tol  [in] Convergence tolerance for velocity, relative to the total speed \f$\sqrt{v_r^2 + (L/r)^2}\f$.
  * @param max_subdiv    [in] Maximum allowed subdivision factor \f$N\f$ for micro-steps.
  * @param grav          [in] Gravitational constant G (simulation units, e.g., G_CONST).
  * @param out_type      [in] Result selection mode for converged integration:
  *                         0 for coarse result, 1 for fine result, 2 for Richardson extrapolation.
+ * @param drag          [in] Drag context for this particle, or NULL (no drag: L is returned unchanged).
+ *                         With drag, L also has to converge (|dL|/r below velocity_tol times the speed
+ *                         scale) and is selected / extrapolated like r and v; the speed scale is the
+ *                         larger of the current and the start-of-step total speed.
  * @param r_out         [out] Pointer to store the final radial position (kpc) after time `h`.
  * @param v_out         [out] Pointer to store the final radial velocity (kpc/Myr) after time `h`.
+ * @param ell_out       [out] Pointer to store the final angular momentum (kpc\f$^2\f$/Myr) after time `h`.
+ * @param edrag_out [out] Specific kinetic energy the drag removed over the step (kpc^2/Myr^2), combined
+ *                  across coarse/fine passes like L; 0 without drag.
+ *
+ * @note The fine pass at level N takes exactly the same micro-steps as the coarse pass at level
+ *       2N, so the coarse pass is only computed at N=1 and the fine result is
+ *       reused as the next coarse result when N doubles.
  */
 static void doAdaptiveFullLeap(
-    int i,               // Particle index for force computation
-    int npts,            // Total number of particles in simulation
+    MencSource *msrc,    // Enclosed-mass source for force computation
     double r_in,         // Initial radius at start of step
     double v_in,         // Initial velocity at start of step
     double ell,          // Angular momentum (conserved during integration)
@@ -3551,80 +4921,123 @@ static void doAdaptiveFullLeap(
     int max_subdiv,      // Maximum subdivision factor allowed
     double grav,         // Gravitational constant (renamed from G to avoid macro collision)
     int out_type,        // Result selection: 0=coarse, 1=fine, 2=Richardson extrapolation
+    const DragSource *drag, // Drag context, or NULL for no drag
     double *r_out,       // Output parameter for final radius
-    double *v_out        // Output parameter for final velocity
+    double *v_out,       // Output parameter for final velocity
+    double *ell_out,     // Output parameter for final angular momentum
+    double *edrag_out    // Output: specific kinetic energy removed by drag (0 without drag)
 )
 {
     int N = 1; // Start with N=1 micro-steps.
 
-    // Initialize coarse/fine results (first coarse pass).
-    double r_coarse = r_in, v_coarse = v_in;
-    double r_fine = r_in, v_fine = v_in;
+    // Initialize coarse/fine results.
+    double r_coarse = r_in, v_coarse = v_in, ell_coarse = ell, e_coarse = 0.0;
+    double r_fine = r_in, v_fine = v_in, ell_fine = ell, e_fine = 0.0;
+    // With drag, errors are measured against the larger of the current and the start-of-step total
+    // speed: strong drag can slow a star by orders of magnitude within a step, and tolerances
+    // relative to the vanishing speed / angular momentum could then never be met.
+    const double v_total_in = drag ? sqrt(v_in * v_in + (ell / (fabs(r_in) + 1.0e-30)) * (ell / (fabs(r_in) + 1.0e-30))) : 0.0;
 
-    while (N <= max_subdiv)
+    if (N <= max_subdiv)
     {
-        // Coarse pass (2N+1 steps)
+        // Coarse pass (2N+1 steps), computed at N=1 only (see @note above).
         doMicroLeapfrog(
-            i, npts, r_in, v_in, ell,
+            msrc, r_in, v_in, ell,
             h, N, (2 * N + 1),
-            grav,
-            &r_coarse, &v_coarse);
+            grav, drag,
+            &r_coarse, &v_coarse, &ell_coarse, &e_coarse);
 
-        // Fine pass (4N+1 steps)
-        doMicroLeapfrog(
-            i, npts, r_in, v_in, ell,
-            h, N, (4 * N + 1),
-            grav,
-            &r_fine, &v_fine);
-
-        // Compare radius, velocity.
-        double radius_diff = fabs(r_fine - r_coarse) / (fabs(r_fine) + 1.0e-30);
-        double velocity_diff = fabs(v_fine - v_coarse) / (fabs(v_fine) + 1.0e-30);
-
-        if ((radius_diff < radius_tol) && (velocity_diff < velocity_tol))
+        while (1)
         {
-            // Tolerances met => output according to out_type.
-            if (out_type == 0)
+            // Fine pass (4N+1 steps)
+            doMicroLeapfrog(
+                msrc, r_in, v_in, ell,
+                h, N, (4 * N + 1),
+                grav, drag,
+                &r_fine, &v_fine, &ell_fine, &e_fine);
+
+            // Compare radius, velocity.
+            // The velocity error is scaled by the total speed sqrt(v_r^2 + (L/r)^2) rather than |v_r|:
+            // |v_r| passes through zero at every turning point, where a relative test cannot be met
+            // (roundoff exceeds tol*|v_r|) and refinement would run all the way to max_subdiv.
+            double radius_diff = fabs(r_fine - r_coarse) / (fabs(r_fine) + 1.0e-30);
+            double v_tan_fine = ell_fine / (fabs(r_fine) + 1.0e-30);
+            double v_total_fine = sqrt(v_fine * v_fine + v_tan_fine * v_tan_fine);
+            double velocity_diff = fabs(v_fine - v_coarse) / (v_total_fine + 1.0e-30);
+            int ell_ok = 1;
+            if (drag)
             {
-                *r_out = r_coarse;
-                *v_out = v_coarse;
+                // L evolves and must converge too, as a tangential-velocity error |dL|/r on the same
+                // speed scale as v_r (without drag L is exact and these tests are skipped).
+                double v_scale = fmax(v_total_fine, v_total_in) + 1.0e-30;
+                velocity_diff = fabs(v_fine - v_coarse) / v_scale;
+                ell_ok = fabs(ell_fine - ell_coarse) / (fabs(r_fine) + 1.0e-30) < velocity_tol * v_scale;
             }
-            else if (out_type == 1)
+
+            if ((radius_diff < radius_tol) && (velocity_diff < velocity_tol) && ell_ok)
             {
-                *r_out = r_fine;
-                *v_out = v_fine;
+                // Tolerances met => output according to out_type.
+                *ell_out = ell;
+                *edrag_out = 0.0;
+                if (out_type == 0)
+                {
+                    *r_out = r_coarse;
+                    *v_out = v_coarse;
+                    if (drag) { *ell_out = ell_coarse; *edrag_out = e_coarse; }
+                }
+                else if (out_type == 1)
+                {
+                    *r_out = r_fine;
+                    *v_out = v_fine;
+                    if (drag) { *ell_out = ell_fine; *edrag_out = e_fine; }
+                }
+                else
+                {
+                    // Richardson extrapolation for higher-order result.
+                    // The fine pass uses exactly half the coarse step and leapfrog error is
+                    // O(h^2), so the extrapolated value is (4*fine - coarse)/3.
+                    *r_out = (4.0 * r_fine - r_coarse) / 3.0;
+                    *v_out = (4.0 * v_fine - v_coarse) / 3.0;
+                    if (drag) { *ell_out = (4.0 * ell_fine - ell_coarse) / 3.0; *edrag_out = (4.0 * e_fine - e_coarse) / 3.0; }
+                }
+                return; // Done.
             }
-            else
-            {
-                // Richardson extrapolation for higher-order result
-                *r_out = 4.0 * r_fine - 3.0 * r_coarse;
-                *v_out = 4.0 * v_fine - 3.0 * v_coarse;
-            }
-            return; // Done.
-        }
-        else
-        {
+
             // Not converged, increase refinement
+            if (N > max_subdiv / 2)
+            {
+                N *= 2;
+                break; // The next level would exceed max_subdiv
+            }
+            r_coarse = r_fine; // Fine pass at N == coarse pass at 2N
+            v_coarse = v_fine;
+            ell_coarse = ell_fine;
+            e_coarse = e_fine;
             N *= 2;
         }
     }
 
-    // Exiting while(N <= max_subdiv) loop indicates convergence failure
+    // Reaching here indicates convergence failure within max_subdiv
     // Return the last available result based on out_type.
+    *ell_out = ell;
+    *edrag_out = 0.0;
     if (out_type == 0)
     {
         *r_out = r_coarse;
         *v_out = v_coarse;
+        if (drag) { *ell_out = ell_coarse; *edrag_out = e_coarse; }
     }
     else if (out_type == 1)
     {
         *r_out = r_fine;
         *v_out = v_fine;
+        if (drag) { *ell_out = ell_fine; *edrag_out = e_fine; }
     }
     else
     {
-        *r_out = 4.0 * r_fine - 3.0 * r_coarse;
-        *v_out = 4.0 * v_fine - 3.0 * v_coarse;
+        *r_out = (4.0 * r_fine - r_coarse) / 3.0;
+        *v_out = (4.0 * v_fine - v_coarse) / 3.0;
+        if (drag) { *ell_out = (4.0 * ell_fine - ell_coarse) / 3.0; *edrag_out = (4.0 * e_fine - e_coarse) / 3.0; }
     }
 }
 
@@ -3663,22 +5076,17 @@ static inline double dRhoDtaufun(double rhoVal, double vVal)
  *          It calls `gravitational_force_rho_v` and `effective_angular_force_rho_v`.
  *          This combined force is used in the equations of motion for Levi-Civita regularization.
  *
- * @param i          [in] Particle index (0 to npts-1), for rank in gravitational force calculation.
- * @param npts       [in] Total number of particles.
- * @param totalmass  [in] Total halo mass of the system (\f$M_{\odot}\f$) used for gravitational force.
- * @param grav       [in] Gravitational constant G (simulation units).
+ * @param msrc          [in,out] Enclosed-mass source (constant rank value, or the M(r) field with a per-particle search hint).
  * @param ell        [in] Angular momentum per unit mass (kpc\f$^2\f$/Myr).
  * @param rhoVal     [in] Current value of the regularized radial coordinate \f$\rho = \sqrt{r}\f$.
  * @return double    \f$dv/d\tau\f$ in Levi-Civita coordinates (kpc\f$^2\f$/Myr\f$^2\f$).
  */
 static inline double forceLCfun(
-    int i, int npts,
-    double totalmass,
-    double grav,
+    MencSource *msrc,
     double ell,
     double rhoVal)
 {
-    double gravPart = gravitational_force_rho_v(rhoVal, i, npts, grav, totalmass);
+    double gravPart = gravitational_force_rho_v(rhoVal, menc_at(msrc, rhoVal * rhoVal));
     double angPart = effective_angular_force_rho_v(rhoVal, ell);
     return gravPart + angPart;
 }
@@ -3694,8 +5102,7 @@ static inline double forceLCfun(
  *          the state precisely at the target physical time.
  *          This method is particularly effective for handling close encounters where \f$r → 0\f$.
  *
- * @param i         [in] Particle index (0 to npts-1), for rank in force calculation.
- * @param npts      [in] Total number of particles.
+ * @param msrc          [in,out] Enclosed-mass source (constant rank value, or the M(r) field with a per-particle search hint).
  * @param r_in      [in] Initial physical radial position (kpc) at the start of the physical step `dt`.
  * @param v_in      [in] Initial physical radial velocity (kpc/Myr) at the start of `dt`.
  * @param ell       [in] Angular momentum per unit mass (kpc\f$^2\f$/Myr) for the force calculation.
@@ -3707,8 +5114,7 @@ static inline double forceLCfun(
  * @param v_out     [out] Pointer to store the final physical radial velocity (kpc/Myr) after time `dt`.
  */
 static void doLeviCivitaLeapfrog(
-    int i,
-    int npts,
+    MencSource *msrc,
     double r_in,
     double v_in,
     double ell,
@@ -3718,6 +5124,7 @@ static void doLeviCivitaLeapfrog(
     double *r_out,
     double *v_out)
 {
+    (void)grav; // Gravity is evaluated via the enclosed-mass source (gravitational_force uses G_CONST)
     // Transform to Levi-Civita coordinates: rho = sqrt(r)
     double rho = sqrt(r_in);
     double v_rad = v_in;
@@ -3753,7 +5160,7 @@ static void doLeviCivitaLeapfrog(
         }
 
         // Leapfrog step 1: Evaluate force at current position
-        double fval = forceLCfun(i, npts, g_active_halo_mass, grav, ell, rho_cur);
+        double fval = forceLCfun(msrc, ell, rho_cur);
 
         // Leapfrog step 2: First half-kick for velocity
         double v_half = v_cur + 0.5 * deltaTau * fval;
@@ -3762,7 +5169,7 @@ static void doLeviCivitaLeapfrog(
         double rho_next = rho_cur + deltaTau * dRhoDtaufun(rho_cur, v_half);
 
         // Leapfrog step 4: Second half-kick with force at new position
-        double fval2 = forceLCfun(i, npts, g_active_halo_mass, grav, ell, rho_next);
+        double fval2 = forceLCfun(msrc, ell, rho_next);
         double v_next = v_half + 0.5 * deltaTau * fval2;
 
         // Update physical time using midpoint rho value
@@ -3831,12 +5238,13 @@ static void doLeviCivitaLeapfrog(
  * @details This helper function advances the particle state in regularized coordinates
  *          \f$(ρ, v_{rad}, t_{phys})\f$ over a total fictitious time interval `h_tau` (\f$Δτ_{total}\f$)
  *          by taking a specified number of `subSteps` fixed-size micro-steps (\f$δτ = Δτ_{total} / \text{subSteps}\f$).
- *          Each micro-step uses a leapfrog-like scheme (Kick-Drift-Kick for \f$ρ, v_{rad}\f$)
- *          and updates the accumulated physical time \f$t_{phys}\f$ using \f$dt_{phys} = δτ \cdot ρ_{mid}^2\f$.
+ *          Each micro-step uses a Kick-Drift-Kick scheme for \f$ρ, v_{rad}\f$. The drift is solved
+ *          exactly (\f$ρ \to ρ\,e^{v δτ/2}\f$ with \f$v\f$ frozen), which keeps the splitting symmetric
+ *          and second order, and the accumulated physical time \f$t_{phys}\f$ is advanced by the
+ *          exact drift integral \f$\int ρ^2 dτ = ρ^2 (e^{v δτ} - 1)/v\f$.
  *          This function is called by `doSingleTauStepAdaptiveLeviCivita` for its coarse and fine passes.
  *
- * @param i         [in] Particle index (0 to npts-1), for rank in force calculation.
- * @param npts      [in] Total number of particles.
+ * @param msrc          [in,out] Enclosed-mass source (constant rank value, or the M(r) field with a per-particle search hint).
  * @param rho_in    [in] Initial \f$ρ = \sqrt{r}\f$ at the start of the `h_tau` interval.
  * @param v_in      [in] Initial radial velocity \f$v_{rad}\f$ at the start of `h_tau`.
  * @param t_in      [in] Initial accumulated physical time \f$t_{phys}\f$ at the start of `h_tau`.
@@ -3844,13 +5252,18 @@ static void doLeviCivitaLeapfrog(
  * @param h_tau     [in] Total fictitious time interval \f$Δτ_{total}\f$ for this integration sequence.
  * @param grav      [in] Gravitational constant G (simulation units).
  * @param ell       [in] Angular momentum per unit mass (kpc\f$^2\f$/Myr).
+ * @param drag      [in] Drag context for this particle, or NULL. With drag, each half-kick is
+ *                       followed by v, L *= exp(-k ρ^2 δτ/2) (dt_phys = ρ^2 dτ), with k from
+ *                       drag_force() at the pre-kick state.
  * @param rho_out   [out] Pointer to store the final \f$ρ\f$ after `h_tau`.
  * @param v_out     [out] Pointer to store the final \f$v_{rad}\f$ after `h_tau`.
  * @param t_out     [out] Pointer to store the final accumulated \f$t_{phys}\f$ after `h_tau`.
+ * @param ell_out   [out] Pointer to store the final angular momentum; equals `ell` without drag.
+ * @param edrag_out [out] Specific kinetic energy the drag removed over the step (kpc^2/Myr^2), combined
+ *                  across coarse/fine passes like L; 0 without drag.
  */
 static void doMicroLeviCivita(
-    int i,
-    int npts,
+    MencSource *msrc,
     double rho_in,
     double v_in,
     double t_in,
@@ -3858,33 +5271,65 @@ static void doMicroLeviCivita(
     double h_tau,
     double grav,
     double ell,
+    const DragSource *drag,
     double *rho_out,
     double *v_out,
-    double *t_out)
+    double *t_out,
+    double *ell_out,
+    double *edrag_out)
 {
+    (void)grav; // Gravity is evaluated via the enclosed-mass source (gravitational_force uses G_CONST)
 
     double dtau = h_tau / (double)subSteps;
     double rho_curr = rho_in;
     double v_curr = v_in;
     double t_curr = t_in;
+    double e_drag = 0.0; // specific kinetic energy removed by drag (kpc^2/Myr^2)
 
     for (int ss = 0; ss < subSteps; ss++)
     {
         // Half-kick.
-        double fLC = forceLCfun(i, npts, g_active_halo_mass, grav, ell, rho_curr);
+        double k_tau1 = 0.0;
+        if (drag) k_tau1 = drag_rate(drag, rho_curr * rho_curr, v_curr, ell) * (rho_curr * rho_curr);
+        msrc->t = t_curr; // physical time of this force evaluation (read only by --star-substeps)
+        double fLC = forceLCfun(msrc, ell, rho_curr);
         double v_half = v_curr + 0.5 * dtau * fLC;
+        if (drag)
+        {
+            double damp1 = exp(-k_tau1 * 0.5 * dtau);
+            double v_pre = v_half, ell_pre = ell;
+            if (!g_drag_no_radial) v_half *= damp1;
+            ell *= damp1;
+            e_drag += drag_ke_loss(v_pre, v_half, ell_pre, ell, rho_curr * rho_curr);
+        }
 
-        // Drift for rho.
-        double rho_next = rho_curr + dtau * (0.5 * rho_curr * v_half);
+        // Drift for rho, solved exactly with v held at v_half.
+        // dρ/dτ = ½ρv is linear in ρ, so ρ(δτ) = ρ·exp(½·v·δτ). An explicit Euler
+        // drift here would make the whole scheme only first order in δτ.
+        double x = v_half * dtau;
+        double em1 = expm1(x); // exp(v·δτ) - 1 = (ρ_next/ρ_curr)² - 1
+
+        // Accumulate physical time t(τ) exactly over the drift:
+        // ∫ρ² dτ = ρ_curr² · (exp(v·δτ) - 1) / v.
+        double dt_phys = (v_half != 0.0) ? (rho_curr * rho_curr) * (em1 / v_half)
+                                         : (rho_curr * rho_curr) * dtau;
+
+        double rho_next = rho_curr * sqrt(1.0 + em1);
 
         // Second half-kick.
-        double fLC2 = forceLCfun(i, npts, g_active_halo_mass, grav, ell, rho_next);
+        double k_tau2 = 0.0;
+        if (drag) k_tau2 = drag_rate(drag, rho_next * rho_next, v_half, ell) * (rho_next * rho_next);
+        msrc->t = t_curr + dt_phys;
+        double fLC2 = forceLCfun(msrc, ell, rho_next);
         double v_next = v_half + 0.5 * dtau * fLC2;
-
-        // Accumulate physical time t(τ).
-        // Simplest approach: use midpoint for rho =>  ρ_mid^2.
-        double rho_mid = 0.5 * (rho_curr + rho_next);
-        double dt_phys = dtau * (rho_mid * rho_mid);
+        if (drag)
+        {
+            double damp2 = exp(-k_tau2 * 0.5 * dtau);
+            double v_pre = v_next, ell_pre = ell;
+            if (!g_drag_no_radial) v_next *= damp2;
+            ell *= damp2;
+            e_drag += drag_ke_loss(v_pre, v_next, ell_pre, ell, rho_next * rho_next);
+        }
 
         t_curr += dt_phys;
         rho_curr = rho_next;
@@ -3894,6 +5339,22 @@ static void doMicroLeviCivita(
     *rho_out = rho_curr;
     *v_out = v_curr;
     *t_out = t_curr;
+    *ell_out = ell;
+    *edrag_out = e_drag;
+}
+
+/**
+ * @brief 1 if a Levi-Civita state is usable: rho > 0 and rho, v finite. Tests the exponent bits, since
+ *        -ffast-math lets the compiler assume isfinite() is always true.
+ */
+#define LC_MAX_RETRY 40 ///< doAdaptiveFullLeviCivita: retries (each with deltaTau / 4) of a tau-step that ended at rho = 0.
+static inline int lc_state_ok(double rho, double v)
+{
+    uint64_t br, bv;
+    memcpy(&br, &rho, sizeof br);
+    memcpy(&bv, &v, sizeof bv);
+    const uint64_t exp_mask = 0x7ff0000000000000ULL;
+    return rho > 0.0 && (br & exp_mask) != exp_mask && (bv & exp_mask) != exp_mask;
 }
 
 /**
@@ -3903,31 +5364,37 @@ static void doMicroLeviCivita(
  *          It employs an adaptive refinement strategy by comparing a "coarse" integration
  *          (using \f$2N+1\f$ micro-steps via `doMicroLeviCivita`) with a "fine" integration
  *          (using \f$4N+1\f$ micro-steps). The subdivision factor \f$N\f$ starts at 1 and is
- *          doubled if the relative differences in \f$ρ\f$ and \f$v_{rad}\f$ between coarse and fine
+ *          doubled if the relative differences in \f$r = ρ^2\f$ and \f$v_{rad}\f$ between coarse and fine
  *          results exceed `radius_tol` and `velocity_tol`, respectively. This continues
  *          up to `max_subdiv`. The final state for the \f$Δτ_{guess}\f$ step is chosen based on
  *          `out_type` (coarse, fine, or Richardson extrapolation).
  *          The function outputs the final \f$ρ_{out}\f$, \f$v_{out}\f$ (radial velocity), and
  *          accumulated physical time \f$t_{out}\f$ corresponding to this adaptive \f$Δτ\f$ step.
  *
- * @param i             [in] Particle index (0 to npts-1), for rank in force calculation.
- * @param npts          [in] Total number of particles.
+ * @param msrc          [in,out] Enclosed-mass source (constant rank value, or the M(r) field with a per-particle search hint).
  * @param rho_in        [in] Initial regularized radial coordinate \f$ρ = \sqrt{r}\f$ at the start of \f$Δτ_{guess}\f$.
  * @param v_in          [in] Initial radial velocity \f$v_{rad}\f$ at the start of \f$Δτ_{guess}\f$.
  * @param t_in          [in] Initial accumulated physical time \f$t_{phys}\f$ at the start of \f$Δτ_{guess}\f$.
  * @param h_guess       [in] The proposed total fictitious time step \f$Δτ_{guess}\f$ for this adaptive step.
- * @param radius_tol    [in] Relative convergence tolerance for \f$ρ\f$ comparison.
- * @param velocity_tol  [in] Relative convergence tolerance for \f$v_{rad}\f$ comparison.
+ * @param radius_tol    [in] Relative convergence tolerance for the physical radius \f$r = ρ^2\f$.
+ * @param velocity_tol  [in] Convergence tolerance for \f$v_{rad}\f$, relative to the total speed \f$\sqrt{v_r^2 + (L/r)^2}\f$.
  * @param max_subdiv    [in] Maximum subdivision factor \f$N\f$ for micro-steps within `doMicroLeviCivita`.
  * @param grav          [in] Gravitational constant G (simulation units).
  * @param ell           [in] Angular momentum per unit mass (kpc\f$^2\f$/Myr).
  * @param out_type      [in] Result selection for converged micro-integration: 0=coarse, 1=fine, 2=Richardson.
+ * @param drag          [in] Drag context for this particle, or NULL (L returned unchanged). With drag,
+ *                         L must also converge (|dL|/r below velocity_tol times the speed scale, the
+ *                         larger of the current total speed and `v_scale_step`).
+ * @param v_scale_step  [in] With drag: total speed at the start of the physical timestep (unused without drag).
  * @param rho_out       [out] Pointer to store the final \f$ρ\f$ after the adaptive \f$Δτ_{guess}\f$ step.
  * @param v_out         [out] Pointer to store the final \f$v_{rad}\f$ after the adaptive \f$Δτ_{guess}\f$ step.
  * @param t_out         [out] Pointer to store the final accumulated physical time \f$t_{phys}\f$ after this step.
+ * @param ell_out       [out] Pointer to store the final angular momentum after this step.
+ * @param edrag_out [out] Specific kinetic energy the drag removed over the step (kpc^2/Myr^2), combined
+ *                  across coarse/fine passes like L; 0 without drag.
  */
 static void doSingleTauStepAdaptiveLeviCivita(
-    int i, int npts,
+    MencSource *msrc,
     double rho_in,
     double v_in,
     double t_in,
@@ -3938,81 +5405,138 @@ static void doSingleTauStepAdaptiveLeviCivita(
     double grav,
     double ell,
     int out_type,
+    const DragSource *drag,
+    double v_scale_step,
     double *rho_out,
     double *v_out,
-    double *t_out)
+    double *t_out,
+    double *ell_out,
+    double *edrag_out)
 {
     // Initialize with the smallest subdivision factor N=1
     int N = 1;
+    // With drag, errors are measured against the larger of the current total speed and
+    // v_scale_step, the total speed at the start of the physical timestep (see doAdaptiveFullLeap).
+    const double v_total_in = v_scale_step;
 
-    while (N <= max_subdiv)
+    if (N <= max_subdiv)
     {
-        // COARSE integration: use subSteps = 2N+1
-        double rhoC, vC, tC;
+        // COARSE integration: use subSteps = 2N+1. Computed at N=1 only: the
+        // fine pass at N uses 4N+1 micro-steps, which is exactly the coarse pass at 2N.
+        double rhoC, vC, tC, ellC, eC;
         doMicroLeviCivita(
-            i, npts,
+            msrc,
             rho_in, v_in,
             t_in,
             (2 * N + 1),
             h_guess,
             grav,
-            ell,
-            &rhoC, &vC, &tC);
+            ell, drag,
+            &rhoC, &vC, &tC, &ellC, &eC);
 
-        // FINE integration: use subSteps = 4N+1
-        double rhoF, vF, tF;
-        doMicroLeviCivita(
-            i, npts,
-            rho_in, v_in,
-            t_in,
-            (4 * N + 1),
-            h_guess,
-            grav,
-            ell,
-            &rhoF, &vF, &tF);
-
-        // Compare final radius and velocity for convergence
-        // Calculate relative differences between coarse and fine solutions
-
-        double rF = rhoF * rhoF;
-
-        double rhodif = fabs(rhoF - rhoC) / (fabs(rF) + 1.0e-30); // Relative radial difference
-        double vdif = fabs(vF - vC) / (fabs(vF) + 1.0e-30);       // Relative velocity difference
-
-        if ((rhodif < radius_tol) && (vdif < velocity_tol))
+        while (1)
         {
-            if (out_type == 0)
-            {
-                *rho_out = rhoC;
-                *v_out = vC;
-                *t_out = tC;
-            }
-            else if (out_type == 1)
-            {
-                *rho_out = rhoF;
-                *v_out = vF;
-                *t_out = tF;
-            }
-            else
-            {
-                // Apply Richardson extrapolation formula: result = 4*fine - 3*coarse
-                // This provides a higher-order approximation by eliminating leading error terms
-                double rho_rich = 4.0 * rhoF - 3.0 * rhoC; // Extrapolated ρ value
-                double v_rich = 4.0 * vF - 3.0 * vC;       // Extrapolated velocity
-                double t_rich = 4.0 * tF - 3.0 * tC;       // Extrapolated time value
+            // FINE integration: use subSteps = 4N+1
+            double rhoF, vF, tF, ellF, eF;
+            doMicroLeviCivita(
+                msrc,
+                rho_in, v_in,
+                t_in,
+                (4 * N + 1),
+                h_guess,
+                grav,
+                ell, drag,
+                &rhoF, &vF, &tF, &ellF, &eF);
 
-                // Ensure non-negative radius
-                if (rho_rich < 0.0)
-                    rho_rich = 0.0;
-                *rho_out = rho_rich;
-                *v_out = v_rich;
-                *t_out = t_rich;
+            // Compare final radius and velocity for convergence
+            // Calculate relative differences between coarse and fine solutions
+
+            // Relative difference in physical radius r = ρ², matching the radius_tol
+            // semantics of doAdaptiveFullLeap.
+            double rF = rhoF * rhoF;
+            double rC = rhoC * rhoC;
+
+            // Velocity difference scaled by the total speed sqrt(v_r^2 + (L/r)^2) rather than |v_r|,
+            // which vanishes at turning points (see doAdaptiveFullLeap).
+            double vTanF = ellF / (fabs(rF) + 1.0e-30);
+            double vTotF = sqrt(vF * vF + vTanF * vTanF);
+
+            double rhodif = fabs(rF - rC) / (fabs(rF) + 1.0e-30);      // Relative radial difference
+            double vdif = fabs(vF - vC) / (vTotF + 1.0e-30);          // Velocity difference relative to total speed
+            int ell_ok = 1;
+            if (drag)
+            {
+                // L evolves and must converge too, as a tangential-velocity error |dL|/r on the same
+                // speed scale as v_r (without drag L is exact and these tests are skipped).
+                double v_scale = fmax(vTotF, v_total_in) + 1.0e-30;
+                vdif = fabs(vF - vC) / v_scale;
+                ell_ok = fabs(ellF - ellC) / (fabs(rF) + 1.0e-30) < velocity_tol * v_scale;
             }
-            return;
-        }
-        else
-        {
+
+            // A pass whose drift underflowed to rho = 0 (or whose v is inf/NaN) never counts as converged:
+            // two such passes agree exactly in r, and with -ffast-math a NaN v need not fail the test.
+            int state_ok = lc_state_ok(rhoF, vF) && lc_state_ok(rhoC, vC);
+            if (state_ok && (rhodif < radius_tol) && (vdif < velocity_tol) && ell_ok)
+            {
+                *ell_out = ell;
+                *edrag_out = 0.0;
+                if (out_type == 0)
+                {
+                    *rho_out = rhoC;
+                    *v_out = vC;
+                    *t_out = tC;
+                    if (drag) { *ell_out = ellC; *edrag_out = eC; }
+                }
+                else if (out_type == 1)
+                {
+                    *rho_out = rhoF;
+                    *v_out = vF;
+                    *t_out = tF;
+                    if (drag) { *ell_out = ellF; *edrag_out = eF; }
+                }
+                else
+                {
+                    // Apply Richardson extrapolation to eliminate the O(δτ^2) error term.
+                    // Coarse and fine use 2N+1 and 4N+1 micro-steps, so the step ratio is
+                    // q = (4N+1)/(2N+1) (not 2) and the extrapolation is
+                    // (q^2*fine - coarse)/(q^2 - 1) = ((4N+1)^2*fine - (2N+1)^2*coarse) / ((4N+1)^2 - (2N+1)^2).
+                    double nF2 = (4.0 * N + 1.0) * (4.0 * N + 1.0);
+                    double nC2 = (2.0 * N + 1.0) * (2.0 * N + 1.0);
+                    double wF = nF2 / (nF2 - nC2);
+                    double wC = nC2 / (nF2 - nC2);
+                    double rho_rich = wF * rhoF - wC * rhoC; // Extrapolated ρ value
+                    double v_rich = wF * vF - wC * vC;       // Extrapolated velocity
+                    double t_rich = wF * tF - wC * tC;       // Extrapolated time value
+
+                    // The extrapolation can leave rho <= 0 (r = 0 makes the next force 1/0); keep the
+                    // fine solution then, which is positive whenever the step was accepted.
+                    if (!lc_state_ok(rho_rich, v_rich))
+                    {
+                        *rho_out = rhoF;
+                        *v_out = vF;
+                        *t_out = tF;
+                        if (drag) { *ell_out = ellF; *edrag_out = eF; }
+                        return;
+                    }
+                    *rho_out = rho_rich;
+                    *v_out = v_rich;
+                    *t_out = t_rich;
+                    if (drag) { *ell_out = wF * ellF - wC * ellC; *edrag_out = wF * eF - wC * eC; }
+                }
+                return;
+            }
+
             // Not converged, double subdivision factor and try again
+            if (N > max_subdiv / 2)
+            {
+                N *= 2;
+                break; // The next level would exceed max_subdiv
+            }
+            rhoC = rhoF; // Fine pass at N == coarse pass at 2N
+            vC = vF;
+            tC = tF;
+            ellC = ellF;
+            eC = eF;
             N *= 2;
         }
     }
@@ -4020,20 +5544,22 @@ static void doSingleTauStepAdaptiveLeviCivita(
     // Convergence not achieved within max_subdiv iterations
     // Use highest-resolution fine integration as fallback result
     {
-        double rhoF, vF, tF;
+        double rhoF, vF, tF, ellF, eF;
         doMicroLeviCivita(
-            i, npts,
+            msrc,
             rho_in, v_in,
             t_in,
             (4 * N + 1),
             h_guess,
             grav,
-            ell,
-            &rhoF, &vF, &tF);
+            ell, drag,
+            &rhoF, &vF, &tF, &ellF, &eF);
 
         *rho_out = rhoF;
         *v_out = vF;
         *t_out = tF;
+        *ell_out = ellF;
+        *edrag_out = eF;
     }
 }
 
@@ -4046,30 +5572,33 @@ static void doSingleTauStepAdaptiveLeviCivita(
  *          `doSingleTauStepAdaptiveLeviCivita` takes an adaptive \f$Δτ\f$ step.
  *          The loop continues until the accumulated physical time `t_cur` (from summing \f$Δt_{phys}\f$
  *          corresponding to each \f$Δτ\f$) reaches or exceeds the target `dt`.
- *          If a \f$Δτ\f$ step overshoots `dt`, linear interpolation is used to find the
- *          state precisely at `t_cur = dt`. The final regularized state \f$(ρ_f, v_f)\f$ is then
+ *          If a \f$Δτ\f$ step overshoots `dt`, a partial \f$τ\f$-step is re-integrated with its length
+ *          solved by safeguarded Newton iteration (\f$dt/dτ = ρ^2\f$) so that it lands on
+ *          `t_cur = dt`. The final regularized state \f$(ρ_f, v_f)\f$ is then
  *          transformed back to physical coordinates \f$(r_{out}, v_{out})\f$.
  *          An initial guess for \f$Δτ\f$ is made based on `N_taumin` and the initial radius.
  *
- * @param i             [in] Particle index (0 to npts-1), used for rank in gravitational force calculation.
- * @param npts          [in] Total number of particles in the simulation.
+ * @param msrc          [in,out] Enclosed-mass source (constant rank value, or the M(r) field with a per-particle search hint).
  * @param r_in          [in] Initial physical radial position (kpc) at the start of the physical step `dt`.
  * @param v_in          [in] Initial physical radial velocity (kpc/Myr) at the start of `dt`.
- * @param ell           [in] Angular momentum per unit mass (kpc\f$^2\f$/Myr), conserved during integration.
+ * @param ell           [in] Angular momentum per unit mass (kpc\f$^2\f$/Myr), conserved unless `drag` is set.
  * @param dt            [in] The full physical timestep \f$\Delta T_{phys}\f$ (Myr) to advance the particle.
  * @param N_taumin      [in] Target number of fictitious \f$τ\f$-steps within `dt`; influences the initial \f$Δτ\f$ guess.
- * @param radius_tol    [in] Relative convergence tolerance for \f$ρ\f$ comparison within each adaptive \f$τ\f$-step.
- * @param velocity_tol  [in] Relative convergence tolerance for velocity comparison within each adaptive \f$τ\f$-step.
+ * @param radius_tol    [in] Relative convergence tolerance for radius \f$r = ρ^2\f$ within each adaptive \f$τ\f$-step.
+ * @param velocity_tol  [in] Convergence tolerance for velocity (relative to total speed) within each adaptive \f$τ\f$-step.
  * @param max_subdiv    [in] Maximum allowed subdivision factor N for micro-steps within each adaptive \f$τ\f$-step.
  * @param grav          [in] Gravitational constant G (simulation units, e.g., G_CONST).
  * @param out_type      [in] Result selection mode for micro-steps within `doSingleTauStepAdaptiveLeviCivita`:
  *                         0 for coarse, 1 for fine, 2 for Richardson extrapolation.
+ * @param drag          [in] Drag context for this particle, or NULL (L returned unchanged).
  * @param r_out         [out] Pointer to store the final physical radial position (kpc) after time `dt`.
  * @param v_out         [out] Pointer to store the final physical radial velocity (kpc/Myr) after time `dt`.
+ * @param ell_out       [out] Pointer to store the final angular momentum (kpc\f$^2\f$/Myr) after time `dt`.
+ * @param edrag_out [out] Specific kinetic energy the drag removed over the step (kpc^2/Myr^2), combined
+ *                  across coarse/fine passes like L; 0 without drag.
  */
 static void doAdaptiveFullLeviCivita(
-    int i,
-    int npts,
+    MencSource *msrc,
     double r_in,
     double v_in,
     double ell,
@@ -4080,20 +5609,29 @@ static void doAdaptiveFullLeviCivita(
     int max_subdiv,
     double grav,
     int out_type, // 0=coarse,1=fine,2=Richardson
+    const DragSource *drag,
     double *r_out,
-    double *v_out)
+    double *v_out,
+    double *ell_out,
+    double *edrag_out)
 {
+    *edrag_out = 0.0;
     // Handle near-zero radius edge case
     if (r_in < 1.0e-30)
     {
         *r_out = r_in;
         *v_out = v_in;
+        *ell_out = ell;
         return;
     }
 
     // Transform from physical to regularized coordinates
     double rho_current = sqrt(r_in);
     double v_current = v_in;
+    double ell_current = ell;
+    double e_current = 0.0; // drag energy removed over the accepted tau-steps
+    // With drag: speed scale for the tau-steps' error tests, fixed at the start of the physical step.
+    const double v_scale_step = drag ? sqrt(v_in * v_in + (ell / r_in) * (ell / r_in)) : 0.0;
 
     double t_cur = 0.0; // Current physical time.
 
@@ -4110,15 +5648,16 @@ static void doAdaptiveFullLeviCivita(
 
     int stepCount = 0;
     int stepMax = 100000000; // Safety limit on iteration count
+    int n_retry = 0;         // tau-steps retried after ending at rho = 0 or inf/NaN
 
     while (1)
     {
         if (t_cur >= dt)
             break; // Exit when physical time target is reached
 
-        double rho_next, v_next, t_next;
+        double rho_next, v_next, t_next, ell_next, e_next;
         doSingleTauStepAdaptiveLeviCivita(
-            i, npts,
+            msrc,
             rho_current, v_current,
             t_cur,    // physical time in
             deltaTau, // guess for τ
@@ -4126,24 +5665,71 @@ static void doAdaptiveFullLeviCivita(
             velocity_tol,
             max_subdiv,
             grav,
-            ell,
-            out_type,
-            &rho_next, &v_next, &t_next);
+            ell_current,
+            out_type, drag, v_scale_step,
+            &rho_next, &v_next, &t_next, &ell_next, &e_next);
+
+        // A tau-step that ends at rho = 0 or with inf/NaN (deltaTau too large for a near-radial fall onto
+        // the centre, where the drift's exp() underflows) is retried with a quarter of the step.
+        if (!lc_state_ok(rho_next, v_next))
+        {
+            if (++n_retry <= LC_MAX_RETRY)
+            {
+                deltaTau *= 0.25;
+                continue;
+            }
+            break; // give up: return the last good state (t short of dt by the remainder)
+        }
 
         if (t_next > dt)
         {
-            // Handle overshoot case with linear interpolation
-            double alpha = 0.0;
-            if (fabs(t_next - t_cur) > 1.0e-30)
-                alpha = (dt - t_cur) / (t_next - t_cur);
+            // Overshoot: re-integrate a partial τ-step h in (0, deltaTau) that lands on
+            // t = dt, rather than linearly interpolating between the step endpoints
+            // (linear interpolation is not tolerance-controlled and dominated the error).
+            // t(h) increases monotonically with dt/dτ = ρ², so solve t(h) = dt by Newton's
+            // method, safeguarded by bisection on the bracket [h_lo, h_hi].
+            double h_lo = 0.0;
+            double h_hi = deltaTau;
+            double h = deltaTau * (dt - t_cur) / (t_next - t_cur); // Linear initial guess
+            double rho_final = rho_next;
+            double v_final = v_next;
+            double ell_final = ell_next;
+            double e_final = e_next;
 
-            // Interpolate to exact target time dt
-            double rho_final = rho_current + alpha * (rho_next - rho_current);
-            double v_final = v_current + alpha * (v_next - v_current);
+            for (int iter = 0; iter < 60; iter++)
+            {
+                double t_h;
+                doSingleTauStepAdaptiveLeviCivita(
+                    msrc,
+                    rho_current, v_current,
+                    t_cur,
+                    h,
+                    radius_tol,
+                    velocity_tol,
+                    max_subdiv,
+                    grav,
+                    ell_current,
+                    out_type, drag, v_scale_step,
+                    &rho_final, &v_final, &t_h, &ell_final, &e_final);
+
+                double t_err = t_h - dt;
+                if (fabs(t_err) <= 1.0e-12 * dt)
+                    break;
+
+                if (t_err > 0.0)
+                    h_hi = h;
+                else
+                    h_lo = h;
+
+                double h_newton = h - t_err / (rho_final * rho_final);
+                h = (h_newton > h_lo && h_newton < h_hi) ? h_newton : 0.5 * (h_lo + h_hi);
+            }
 
             double r_fin = rho_final * rho_final;
             *r_out = r_fin;
             *v_out = v_final;
+            *ell_out = ell_final;
+            *edrag_out = e_current + e_final;
             return;
         }
         else
@@ -4152,6 +5738,8 @@ static void doAdaptiveFullLeviCivita(
             rho_current = rho_next;
             v_current = v_next;
             t_cur = t_next;
+            ell_current = ell_next;
+            e_current += e_next;
         }
 
         // Check for iteration limit
@@ -4162,6 +5750,8 @@ static void doAdaptiveFullLeviCivita(
             double r_fin = rho_current * rho_current;
             *r_out = r_fin;
             *v_out = v_current;
+            *ell_out = ell_current;
+            *edrag_out = e_current;
             return;
         }
     }
@@ -4170,6 +5760,1346 @@ static void doAdaptiveFullLeviCivita(
     double r_fin = rho_current * rho_current;
     *r_out = r_fin;
     *v_out = v_current;
+    *ell_out = ell_current;
+    *edrag_out = e_current;
+}
+
+// =============================================================================
+// STAR SUB-STEP PHASE (--star-substeps)
+// =============================================================================
+
+typedef struct { double key; int idx; } StarKey; ///< Sort key with star index.
+
+static int star_key_cmp(const void *a, const void *b)
+{
+    double ka = ((const StarKey *)a)->key, kb = ((const StarKey *)b)->key;
+    if (ka < kb) return -1;
+    if (ka > kb) return 1;
+    return ((const StarKey *)a)->idx - ((const StarKey *)b)->idx;
+}
+
+static int g_ss_ns = 0;                 ///< Number of stars (species != 0).
+static int *g_ss_rank = NULL;           ///< Per star: start-of-step rank.
+static double *g_ss_m = NULL;           ///< Per star: mass (Msun).
+static double *g_ss_R = NULL;           ///< Star radii at the M+1 sub-step boundaries, [j * ns + s] (kpc).
+static double *g_ss_v = NULL;           ///< Per star: current radial velocity during the star phase.
+static double *g_ss_ell = NULL;         ///< Per star: current angular momentum during the star phase.
+static double *g_ss_edrag = NULL;       ///< Per star: specific drag energy removed this step.
+static int *g_ss_drag_on = NULL;        ///< Per star: drag active this step.
+static StarInterval *g_ss_iv = NULL;    ///< M intervals for the dark-matter phase plus one frozen scratch interval.
+static StarKey *g_ss_keys = NULL;       ///< Sort scratch.
+static StarProfile g_ss_profile;        ///< This step's star shells, read by the dark-matter phase.
+// --star-substep-method 2 (joint cluster re-integration), see star_substep_clusters
+static double *g_ssc_v0 = NULL;         ///< Per star: radial velocity at the start of the current sub-step.
+static double *g_ssc_ell0 = NULL;       ///< Per star: angular momentum at the start of the current sub-step.
+static double *g_ssc_lo = NULL;         ///< Per star: lower edge of its radial sweep in the sub-step, minus the band.
+static double *g_ssc_hi = NULL;         ///< Per star: upper edge of its radial sweep, plus the band.
+static int *g_ssc_lc = NULL;            ///< Per star: the first pass used the Levi-Civita branch.
+static int *g_ssc_lab = NULL;           ///< Per star: label of the cluster it was last handled in this sub-step, or -1.
+static int *g_ssc_joint = NULL;         ///< Per star: label of the cluster it was jointly integrated in this sub-step, or -1.
+static int *g_ssc_mem = NULL;           ///< Cluster members, cluster by cluster.
+static int *g_ssc_uf = NULL;            ///< Union-find parent per star over the rounds of one sub-step (clusters only grow).
+static int *g_ssc_root = NULL;          ///< Per star: its union-find root this round.
+static int *g_ssc_cnt = NULL;           ///< Per root: number of stars in its cluster.
+static int *g_ssc_off = NULL;           ///< Per root: its cluster index this round, or -1.
+static int *g_ssc_cl_start = NULL;      ///< Per cluster: offset into g_ssc_mem.
+static int *g_ssc_cl_size = NULL;       ///< Per cluster: number of members.
+static int *g_ssc_cl_redo = NULL;       ///< Per cluster: 0 unchanged, 1 integrate jointly, 2 skipped.
+static int *g_ssc_labsize = NULL;       ///< Per label: size of the cluster it names.
+static StarKey *g_ssc_keys = NULL;      ///< Sort scratch.
+static int g_ssc_step = 0;              ///< Current time step (for log messages).
+static struct
+{
+    long long substeps;          ///< Sub-steps with at least one cluster.
+    long long clusters;          ///< Joint integrations of a cluster.
+    long long star_integrations; ///< Stars integrated jointly, summed over those.
+    long long size_hist[6];      ///< Joint integrations by cluster size: 2, 3, 4, 5-8, 9-16, > 16.
+    int max_size;                ///< Largest cluster integrated.
+    long long redo_hist[STAR_SSC_MAX_REDOS + 2]; ///< Sub-steps with clusters by number of redo rounds (last bin: limit hit).
+    long long lc_clusters;       ///< Joint integrations with a member whose first pass used the Levi-Civita branch.
+    long long cap_logged;        ///< Redo-limit hits reported on stderr (the first 10).
+    long long skip_drag;         ///< Clusters left at their first-pass states: a member feels drag.
+    long long nonconv;           ///< Joint integrations that did not reach the tolerances.
+    long long neg_r;             ///< Extrapolated radii <= 0 replaced by the fine pass.
+    long long flip_integrations; ///< Joint integrations in which a member with L > 0 flipped through r = 0.
+    long long flip_doublings;    ///< Doublings of N forced by a flip alone (the tolerances were already met).
+    long long flip_unresolved;   ///< Joint integrations still flipping at the cap (method 2: accepted; 3: promoted).
+    long long flip_logged;       ///< Flip events reported on stderr (the first 10).
+    long long promoted;          ///< Method 3: members promoted to Levi-Civita anchors after flipping at the cap.
+    long long lc_path;           ///< Method 3: joint integrations in shared Levi-Civita time.
+    long long lc_multi;          ///< Method 3: of those, with two or more anchors.
+    long long promoted_nonconv;  ///< Method 3: unconverged joint integrations redone with every member as an anchor.
+    double time_total;           ///< Wall time of the cluster passes (s).
+} g_ssc;
+static int *g_dm_idx_of_rank = NULL;    ///< Per rank: number of dark-matter particles at lower ranks.
+static int g_dm_table_k = 64;           ///< Knot spacing of the dark-matter table.
+static double *g_dm_r = NULL;           ///< Dark-matter radii, ascending.
+static double *g_dm_Mb = NULL;          ///< Dark-matter mass below each dark-matter particle.
+static MencFieldEntry *g_dm_tab = NULL; ///< Dark-matter-only smooth M(r) knot table.
+static int g_dm_nk = 0;                 ///< Knots in g_dm_tab.
+
+/**
+ * @brief Allocates the --star-substeps buffers (once, before the time loop).
+ */
+static void allocate_star_substeps(double **particles, int npts, int M)
+{
+    int ns = 0;
+    for (int i = 0; i < npts; i++)
+        if (particles[P_SPECIES][i] != 0) ns++;
+    g_ss_ns = ns;
+    size_t nsz = (size_t)(ns > 0 ? ns : 1);
+    g_ss_rank = (int *)malloc(nsz * sizeof(int));
+    g_ss_m = (double *)malloc(nsz * sizeof(double));
+    g_ss_R = (double *)malloc((size_t)(M + 1) * nsz * sizeof(double));
+    g_ss_v = (double *)malloc(nsz * sizeof(double));
+    g_ss_ell = (double *)malloc(nsz * sizeof(double));
+    g_ss_edrag = (double *)malloc(nsz * sizeof(double));
+    g_ss_drag_on = (int *)malloc(nsz * sizeof(int));
+    g_ss_keys = (StarKey *)malloc(nsz * sizeof(StarKey));
+    g_ss_iv = (StarInterval *)calloc((size_t)(M + 1), sizeof(StarInterval));
+    int ok = g_ss_rank && g_ss_m && g_ss_R && g_ss_v && g_ss_ell && g_ss_edrag && g_ss_drag_on && g_ss_keys &&
+             g_ss_iv;
+    for (int j = 0; ok && j <= M; j++)
+    {
+        g_ss_iv[j].hi_by_star = (double *)malloc(nsz * sizeof(double));
+        g_ss_iv[j].lo_sorted = (double *)malloc(nsz * sizeof(double));
+        g_ss_iv[j].lo_idx = (int *)malloc(nsz * sizeof(int));
+        g_ss_iv[j].hi_sorted = (double *)malloc(nsz * sizeof(double));
+        g_ss_iv[j].hi_mcum = (double *)malloc(nsz * sizeof(double));
+        ok = g_ss_iv[j].hi_by_star && g_ss_iv[j].lo_sorted && g_ss_iv[j].lo_idx && g_ss_iv[j].hi_sorted && g_ss_iv[j].hi_mcum;
+    }
+    if (ok && g_star_substep_method >= 2)
+    {
+        g_ssc_v0 = (double *)malloc(nsz * sizeof(double));
+        g_ssc_ell0 = (double *)malloc(nsz * sizeof(double));
+        g_ssc_lo = (double *)malloc(nsz * sizeof(double));
+        g_ssc_hi = (double *)malloc(nsz * sizeof(double));
+        g_ssc_lc = (int *)malloc(nsz * sizeof(int));
+        g_ssc_lab = (int *)malloc(nsz * sizeof(int));
+        g_ssc_joint = (int *)malloc(nsz * sizeof(int));
+        g_ssc_mem = (int *)malloc(nsz * sizeof(int));
+        g_ssc_cl_start = (int *)malloc(nsz * sizeof(int));
+        g_ssc_cl_size = (int *)malloc(nsz * sizeof(int));
+        g_ssc_cl_redo = (int *)malloc(nsz * sizeof(int));
+        g_ssc_labsize = (int *)malloc(nsz * (STAR_SSC_MAX_REDOS + 2) * sizeof(int));
+        g_ssc_keys = (StarKey *)malloc(nsz * sizeof(StarKey));
+        g_ssc_uf = (int *)malloc(nsz * sizeof(int));
+        g_ssc_root = (int *)malloc(nsz * sizeof(int));
+        g_ssc_cnt = (int *)malloc(nsz * sizeof(int));
+        g_ssc_off = (int *)malloc(nsz * sizeof(int));
+        ok = g_ssc_uf && g_ssc_root && g_ssc_cnt && g_ssc_off &&
+             g_ssc_v0 && g_ssc_ell0 && g_ssc_lo && g_ssc_hi && g_ssc_lc && g_ssc_lab && g_ssc_joint && g_ssc_mem &&
+             g_ssc_cl_start && g_ssc_cl_size && g_ssc_cl_redo && g_ssc_labsize && g_ssc_keys;
+        for (int q = 0; ok && q < ns; q++)
+            g_ssc_joint[q] = -1;
+    }
+    if (!ok)
+    {
+        fprintf(stderr, "ERROR: Failed to allocate the --star-substeps buffers\n");
+        CLEAN_EXIT(1);
+    }
+    memset(&g_ss_profile, 0, sizeof(g_ss_profile));
+}
+
+/**
+ * @brief Frees the --star-substeps buffers.
+ */
+static void free_star_substeps(int M)
+{
+    if (g_ss_iv)
+    {
+        for (int j = 0; j <= M; j++)
+        {
+            free(g_ss_iv[j].hi_by_star);
+            free(g_ss_iv[j].lo_sorted);
+            free(g_ss_iv[j].lo_idx);
+            free(g_ss_iv[j].hi_sorted);
+            free(g_ss_iv[j].hi_mcum);
+        }
+    }
+    free(g_ss_iv); g_ss_iv = NULL;
+    free(g_ss_rank); g_ss_rank = NULL;
+    free(g_ss_m); g_ss_m = NULL;
+    free(g_ss_R); g_ss_R = NULL;
+    free(g_ss_v); g_ss_v = NULL;
+    free(g_ss_ell); g_ss_ell = NULL;
+    free(g_ss_edrag); g_ss_edrag = NULL;
+    free(g_ss_drag_on); g_ss_drag_on = NULL;
+    free(g_ss_keys); g_ss_keys = NULL;
+    free(g_ssc_v0); g_ssc_v0 = NULL;
+    free(g_ssc_ell0); g_ssc_ell0 = NULL;
+    free(g_ssc_lo); g_ssc_lo = NULL;
+    free(g_ssc_hi); g_ssc_hi = NULL;
+    free(g_ssc_lc); g_ssc_lc = NULL;
+    free(g_ssc_lab); g_ssc_lab = NULL;
+    free(g_ssc_joint); g_ssc_joint = NULL;
+    free(g_ssc_mem); g_ssc_mem = NULL;
+    free(g_ssc_cl_start); g_ssc_cl_start = NULL;
+    free(g_ssc_cl_size); g_ssc_cl_size = NULL;
+    free(g_ssc_cl_redo); g_ssc_cl_redo = NULL;
+    free(g_ssc_labsize); g_ssc_labsize = NULL;
+    free(g_ssc_keys); g_ssc_keys = NULL;
+    free(g_ssc_uf); g_ssc_uf = NULL;
+    free(g_ssc_root); g_ssc_root = NULL;
+    free(g_ssc_cnt); g_ssc_cnt = NULL;
+    free(g_ssc_off); g_ssc_off = NULL;
+}
+
+/**
+ * @brief Allocates the dark-matter-only M(r) table (--star-substeps or --drag), once before the time loop.
+ */
+static void allocate_dm_table(int npts, int K)
+{
+    g_dm_table_k = K;
+    g_dm_idx_of_rank = (int *)malloc((size_t)npts * sizeof(int));
+    g_dm_r = (double *)malloc((size_t)npts * sizeof(double));
+    g_dm_Mb = (double *)malloc((size_t)npts * sizeof(double));
+    g_dm_tab = (MencFieldEntry *)malloc((size_t)(npts + 2) * sizeof(MencFieldEntry));
+    if (!g_dm_idx_of_rank || !g_dm_r || !g_dm_Mb || !g_dm_tab)
+    {
+        fprintf(stderr, "ERROR: Failed to allocate the dark-matter M(r) table\n");
+        CLEAN_EXIT(1);
+    }
+}
+
+/**
+ * @brief Frees the dark-matter-only M(r) table.
+ */
+static void free_dm_table(void)
+{
+    free(g_dm_idx_of_rank); g_dm_idx_of_rank = NULL;
+    free(g_dm_r); g_dm_r = NULL;
+    free(g_dm_Mb); g_dm_Mb = NULL;
+    free(g_dm_tab); g_dm_tab = NULL;
+}
+
+/**
+ * @brief Builds the lookup tables of one star interval from the radii at its start and end.
+ * @param soft_h [in] Star-star softening support (kpc) when the interval serves the stars' own phase (bands are
+ *                    then rs +- soft_h); 0 for the dark-matter phase (bands rs (1 +- STAR_SHELL_SOFTENING)).
+ */
+static void build_star_interval(StarInterval *I, const double *r0, const double *r1, const double *m, int ns, StarKey *keys,
+                                double soft_h)
+{
+    I->r0 = r0;
+    I->r1 = r1;
+    double wmax = 0.0;
+    for (int st = 0; st < ns; st++)
+    {
+        double a = (r0[st] < r1[st]) ? r0[st] : r1[st];
+        double b = (r0[st] < r1[st]) ? r1[st] : r0[st];
+        double lo = (soft_h > 0.0) ? a - soft_h : a - STAR_SHELL_SOFTENING * fabs(a);
+        double hi = (soft_h > 0.0) ? b + soft_h : b + STAR_SHELL_SOFTENING * fabs(b);
+        keys[st].key = lo;
+        keys[st].idx = st;
+        I->hi_by_star[st] = hi;
+        if (hi - lo > wmax)
+            wmax = hi - lo;
+    }
+    qsort(keys, (size_t)ns, sizeof(StarKey), star_key_cmp);
+    for (int k = 0; k < ns; k++)
+    {
+        I->lo_sorted[k] = keys[k].key;
+        I->lo_idx[k] = keys[k].idx;
+    }
+    for (int st = 0; st < ns; st++)
+    {
+        keys[st].key = I->hi_by_star[st];
+        keys[st].idx = st;
+    }
+    qsort(keys, (size_t)ns, sizeof(StarKey), star_key_cmp);
+    double cum = 0.0;
+    for (int k = 0; k < ns; k++)
+    {
+        I->hi_sorted[k] = keys[k].key;
+        cum += m[keys[k].idx];
+        I->hi_mcum[k] = cum;
+    }
+    I->wmax = wmax;
+}
+
+/**
+ * @brief Builds the dark-matter-only smooth M(r) table from the radius-sorted particles.
+ * @details Same knot table as --menc-smooth (build_menc_smooth_table), but from the dark matter
+ *          alone; also records, per rank, the number of dark-matter particles below it (the
+ *          search hint and own-mass index into this table).
+ */
+static void build_dm_smooth_table(double **particles, int npts, int K)
+{
+    int n = 0;
+    double mb = 0.0;
+    for (int i = 0; i < npts; i++)
+    {
+        g_dm_idx_of_rank[i] = n;
+        if (particles[P_SPECIES][i] == 0)
+        {
+            g_dm_r[n] = particles[0][i];
+            g_dm_Mb[n] = mb;
+            mb += particles[P_MASS][i];
+            n++;
+        }
+    }
+    g_dm_table_k = K;
+    g_dm_nk = (n > 0) ? build_menc_smooth_table(g_dm_r, g_dm_Mb, n, K, g_dm_tab) : 0;
+}
+
+/**
+ * @brief Enclosed-mass source for --star-substeps: dark-matter-only smooth table plus star shells.
+ *
+ * @param rank      [in] Particle's start-of-step rank.
+ * @param r         [in] Particle's start-of-step radius (kpc).
+ * @param dm_mass   [in] Particle's own mass to exclude from the dark-matter table (0 for a star).
+ * @param stars     [in] Star shells to add.
+ * @param self_star [in] Star index to exclude from `stars`, or -1.
+ */
+static inline MencSource menc_source_split(int rank, double r, double dm_mass, const StarProfile *stars, int self_star)
+{
+    MencSource src = menc_source_smooth(g_dm_idx_of_rank[rank], r, dm_mass, g_dm_tab, g_dm_nk, g_menc_smooth_k);
+    src.use_field = 3;
+    src.stars = stars;
+    src.self_star = self_star;
+    return src;
+}
+
+// -----------------------------------------------------------------------------
+// JOINT CLUSTER RE-INTEGRATION (--star-substep-method 2 and 3)
+// -----------------------------------------------------------------------------
+// Method 2 integrates every cluster in uniform physical-time leapfrog steps (ssc_integrate). Method 3 sends clusters
+// with a Levi-Civita member to a shared regularised time instead (ssc_lc_integrate); see g_star_substep_method.
+// Radius flips: a member with L > 0 cannot reach r = 0, so a drift that carries it through r = 0 (reflected) has
+// stepped over its angular-momentum barrier. Either path then treats the pass as unconverged and doubles N; every
+// joint integration with a flip is logged (ssc_log_flip).
+// In method 1 every star advances over a sub-step with the other stars frozen at its start. For a pair whose
+// shells cross (or come within the softening support) during the sub-step, this costs the frozen-partner energy
+// error J = phi(a1,b1) - phi(a1,b0) - phi(a0,b1) + phi(a0,b0), phi = -G m_a m_b / smax(a, b); for pairs whose radial
+// sweeps stay apart J = 0 exactly. Method 2 finds the stars whose sweeps (widened by the band in which one star's
+// shell acts smoothly on another: the softening support h, or r * STAR_SHELL_SOFTENING without softening) overlap,
+// groups them into clusters (contiguous in radius), and re-integrates every cluster from the start of the sub-step
+// with all its members advancing together, each feeling the others at their current radii, so the pair energies
+// inside a cluster are conserved to the integrator tolerance. A re-integrated cluster can sweep into a star outside
+// it; that star is then merged into the cluster (clusters only grow within a sub-step) and every cluster that grew is
+// redone from the start of the sub-step, at most STAR_SSC_MAX_REDOS times. The physical-time joint pass uses the same
+// leapfrog and coarse/fine tolerances as doAdaptiveFullLeap (a cluster of one would reproduce the first pass exactly).
+// Method 2 also integrates clusters with a member on the Levi-Civita branch in physical time; method 3 integrates
+// them in the shared Levi-Civita time of ssc_lc_integrate. Clusters with a member feeling drag keep their first-pass
+// states. All are counted.
+
+/** @brief Enclosed fraction of star shell rs seen at r: softened pair kernel, or the smoothstep shell without softening. */
+static inline double ssc_frac(double r, double rs, double hs)
+{
+    return (hs > 0.0) ? star_soft_fraction(r, rs, hs) : star_shell_fraction(r, rs);
+}
+
+/**
+ * @brief Accelerations of the n cluster members at radii x: dark-matter table and the stars outside the cluster frozen
+ *        at the sub-step start (src), with the cluster members' frozen shells replaced by their current radii.
+ */
+static void ssc_accel(const int *mem, int n, const double *x, const double *Rj, const double *ell, MencSource *src,
+                      double hs, double *a)
+{
+    for (int p = 0; p < n; p++)
+    {
+        double r = x[p];
+        double M = menc_at(&src[p], r);
+        for (int c = 0; c < n; c++)
+        {
+            if (c == p)
+                continue;
+            int qc = mem[c];
+            M += g_ss_m[qc] * (ssc_frac(r, x[c], hs) - ssc_frac(r, Rj[qc], hs));
+        }
+        if (M < 0.0)
+            M = 0.0;
+        a[p] = gravitational_force(r, M) + effective_angular_force(r, ell[p]);
+    }
+}
+
+/**
+ * @brief Joint kick-drift-kick leapfrog of a cluster over h in Nd drifts (doMicroLeapfrog's sequence). A drift through
+ *        r < 0 is reflected; for a member with L != 0 this is a radius flip, flagged in flip[p]. Returns the number of
+ *        members that flipped.
+ */
+static int ssc_micro(const int *mem, int n, const double *Rj, const double *v0, const double *ell, MencSource *src,
+                     double hs, double h, int Nd, double *x, double *v, double *a, int *flip)
+{
+    int nflip = 0;
+    for (int p = 0; p < n; p++)
+        flip[p] = 0;
+    const double tau = h / (double)Nd;
+    for (int p = 0; p < n; p++)
+    {
+        x[p] = Rj[mem[p]];
+        v[p] = v0[p];
+    }
+    ssc_accel(mem, n, x, Rj, ell, src, hs, a);
+    for (int p = 0; p < n; p++)
+        v[p] += 0.5 * tau * a[p];
+    for (int k = 1; k <= Nd; k++)
+    {
+        for (int p = 0; p < n; p++)
+        {
+            x[p] += tau * v[p];
+            if (x[p] < 0.0)
+            {
+                x[p] = -x[p];
+                v[p] = -v[p];
+                if (ell[p] != 0.0 && !flip[p])
+                {
+                    flip[p] = 1;
+                    nflip++;
+                }
+            }
+        }
+        ssc_accel(mem, n, x, Rj, ell, src, hs, a);
+        const double kick = (k < Nd) ? tau : 0.5 * tau;
+        for (int p = 0; p < n; p++)
+            v[p] += kick * a[p];
+    }
+    return nflip;
+}
+
+/**
+ * @brief Adaptive joint integration of one cluster over the sub-step h from its start-of-sub-step states, in physical
+ *        time: coarse (N drifts) against fine (2N drifts) until every member meets the radius and velocity tolerances
+ *        of doAdaptiveFullLeap and no member flips through r = 0 in either pass (a flip alone forces another doubling,
+ *        counted in *forced). Result chosen by out_type (2 = Richardson). Writes Rn, g_ss_v. flip[p] = 1 for members
+ *        still flipping in the last fine pass when the cap is reached. Returns 1 if converged.
+ */
+static int ssc_integrate(const int *mem, int n, const double *Rj, double *Rn, const StarProfile *PF, double h,
+                         double radius_tol, double velocity_tol, int max_subdiv, int out_type, int *flip, int *forced)
+{
+    MencSource *src = (MencSource *)malloc((size_t)n * sizeof(MencSource));
+    double *buf = (double *)malloc((size_t)n * 7 * sizeof(double));
+    if (!src || !buf)
+    {
+        fprintf(stderr, "ERROR: Failed to allocate a --star-substep-method 2 cluster\n");
+        CLEAN_EXIT(1);
+    }
+    double *v0 = buf, *ell = buf + n, *xc = buf + 2 * n, *vc = buf + 3 * n, *xf = buf + 4 * n, *vf = buf + 5 * n,
+           *a = buf + 6 * n;
+    int *flc = (int *)malloc((size_t)n * sizeof(int));
+    if (!flc)
+    {
+        fprintf(stderr, "ERROR: Failed to allocate a --star-substep-method 2 cluster\n");
+        CLEAN_EXIT(1);
+    }
+    const double hs = PF->soft_h;
+    for (int p = 0; p < n; p++)
+    {
+        int q = mem[p];
+        src[p] = menc_source_split(g_ss_rank[q], Rj[q], 0.0, PF, q);
+        src[p].t = 0.0;
+        v0[p] = g_ssc_v0[q];
+        ell[p] = g_ssc_ell0[q];
+    }
+    const int cap = (max_subdiv < (1 << 20)) ? max_subdiv : (1 << 20);
+    int N = 1, conv = 0;
+    int nfc = ssc_micro(mem, n, Rj, v0, ell, src, hs, h, N, xc, vc, a, flc);
+    while (1)
+    {
+        int nff = ssc_micro(mem, n, Rj, v0, ell, src, hs, h, 2 * N, xf, vf, a, flip);
+        double rd = 0.0, vd = 0.0;
+        for (int p = 0; p < n; p++)
+        {
+            double r_diff = fabs(xf[p] - xc[p]) / (fabs(xf[p]) + 1.0e-30);
+            double vt = ell[p] / (fabs(xf[p]) + 1.0e-30);
+            double v_diff = fabs(vf[p] - vc[p]) / (sqrt(vf[p] * vf[p] + vt * vt) + 1.0e-30);
+            if (r_diff > rd) rd = r_diff;
+            if (v_diff > vd) vd = v_diff;
+        }
+        const int tol_ok = (rd < radius_tol && vd < velocity_tol);
+        if (tol_ok && nfc == 0 && nff == 0)
+        {
+            conv = 1;
+            break;
+        }
+        if (tol_ok)
+            (*forced)++; // a radius flip alone forces this doubling
+        if (N > cap / 2)
+            break;
+        memcpy(xc, xf, (size_t)n * sizeof(double));
+        memcpy(vc, vf, (size_t)n * sizeof(double));
+        nfc = nff;
+        N *= 2;
+    }
+    if (conv)
+        for (int p = 0; p < n; p++)
+            flip[p] = 0;
+    for (int p = 0; p < n; p++)
+    {
+        int q = mem[p];
+        if (out_type == 0)
+        {
+            Rn[q] = xc[p];
+            g_ss_v[q] = vc[p];
+        }
+        else if (out_type == 1)
+        {
+            Rn[q] = xf[p];
+            g_ss_v[q] = vf[p];
+        }
+        else
+        {
+            Rn[q] = (4.0 * xf[p] - xc[p]) / 3.0;
+            g_ss_v[q] = (4.0 * vf[p] - vc[p]) / 3.0;
+            if (!(Rn[q] > 0.0))
+            {
+                // Richardson extrapolation past the centre (a star passing close to r = 0): keep the fine pass,
+                // whose drifts reflect through r = 0 and so stay at r >= 0.
+                Rn[q] = xf[p];
+                g_ss_v[q] = vf[p];
+#pragma omp atomic
+                g_ssc.neg_r++;
+            }
+        }
+        g_ss_ell[q] = ell[p];
+    }
+    free(flc);
+    free(src);
+    free(buf);
+    return conv;
+}
+
+/** @brief Union-find root of star q over this sub-step's clusters (path halving). */
+static inline int ssc_find(int q)
+{
+    while (g_ssc_uf[q] != q)
+    {
+        g_ssc_uf[q] = g_ssc_uf[g_ssc_uf[q]];
+        q = g_ssc_uf[q];
+    }
+    return q;
+}
+
+/** @brief Merges the clusters of stars a and b. */
+static inline void ssc_union(int a, int b)
+{
+    a = ssc_find(a);
+    b = ssc_find(b);
+    if (a != b)
+    {
+        if (a < b) g_ssc_uf[b] = a; else g_ssc_uf[a] = b;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// --star-substep-method 3: joint integration in a shared Levi-Civita time
+// -----------------------------------------------------------------------------
+// The single-star Levi-Civita branch (doMicroLeviCivita) uses rho = sqrt(r), the physical radial velocity v and the
+// fictitious time tau with dt = r dtau: kick v += (dtau/2) r a(r); drift (v fixed) rho -> rho exp(v dtau / 2), which
+// takes the physical time r (exp(v dtau) - 1) / v. A cluster shares one clock, dt = g(x) dtau, with
+// g = 1 / sum_{anchors k} 1/r_k over its anchors (the members on the Levi-Civita branch):
+//   kick:  v_p += (dtau/2) g(x) a_p(x) for every member p (a_p from ssc_accel, positions fixed);
+//   drift: velocities fixed, so every member moves linearly in physical time, r_p(t) = r_p + v_p t, and the drift
+//          lasts the physical time dt solving dtau = sum_k ln(r_k(dt)/r_k) / v_k (ssc_lc_drift). With one anchor
+//          this is dt = r_A (exp(v_A dtau) - 1) / v_A, the single-star formula, so a cluster whose partners have no
+//          mass reproduces doAdaptiveFullLeviCivita for its anchor. An inward anchor never reaches r = 0 (dtau
+//          diverges first). A partner that drifts through r = 0 with L != 0 is reflected and flagged as a flip.
+// The adaptive structure is that of doAdaptiveFullLeviCivita: tau-steps of h / (2 g N_taumin), each refined by coarse
+// (2N+1 micro-steps) against fine (4N+1) until every member meets the tolerances and no member flips; the last
+// tau-step is solved by Newton for t = h.
+
+/** @brief Finite-double test by the exponent bits (-ffast-math may drop isfinite()). */
+static inline int ssc_finite(double x)
+{
+    uint64_t bits;
+    memcpy(&bits, &x, sizeof(bits));
+    return ((bits >> 52) & 0x7FF) != 0x7FF;
+}
+
+/** @brief Time-transformation weight g = 1 / sum over anchors of 1/x_k (dt = g dtau). */
+static inline double ssc_lc_g(int n, const int *anc, const double *x)
+{
+    double s = 0.0;
+    for (int p = 0; p < n; p++)
+        if (anc[p])
+            s += 1.0 / x[p];
+    return 1.0 / s;
+}
+
+/**
+ * @brief Drift of a cluster over fictitious time dtau at fixed velocities (method 3). Returns the physical time dt
+ *        of the drift and moves every member by v dt. Anchors stay at r > 0. A non-anchor drifting through r < 0 is
+ *        reflected (flip[p] = 1 if L != 0); returns the number of new flips in *nflip.
+ */
+static double ssc_lc_drift(int n, const int *anc, const double *ell, double *x, double *v, double dtau, int *flip,
+                           int *nflip)
+{
+    int na = 0, k1 = -1;
+    for (int p = 0; p < n; p++)
+        if (anc[p])
+        {
+            na++;
+            k1 = p;
+        }
+    double dt;
+    if (na == 1)
+    {
+        // Single anchor: the closed form of doMicroLeviCivita.
+        double xv = v[k1] * dtau;
+        double em1 = expm1(xv);
+        dt = (v[k1] != 0.0) ? x[k1] * (em1 / v[k1]) : x[k1] * dtau;
+        x[k1] = x[k1] * (1.0 + em1);
+    }
+    else
+    {
+        // Several anchors: solve F(dt) = sum_k ln(1 + v_k dt / x_k) / v_k - dtau = 0. F increases with dt and
+        // F >= each single-anchor term, so dt <= min_k of the single-anchor solutions (bracket [0, hi]).
+        double hi = 0.0, sinv = 0.0;
+        int first = 1;
+        for (int p = 0; p < n; p++)
+        {
+            if (!anc[p])
+                continue;
+            double dk = (v[p] != 0.0) ? x[p] * (expm1(v[p] * dtau) / v[p]) : x[p] * dtau;
+            if (first || dk < hi)
+                hi = dk;
+            first = 0;
+            sinv += 1.0 / x[p];
+        }
+        double lo = 0.0;
+        dt = dtau / sinv;
+        if (!(dt > lo && dt < hi))
+            dt = 0.5 * (lo + hi);
+        for (int it = 0; it < 200; it++)
+        {
+            double F = -dtau, dF = 0.0;
+            for (int p = 0; p < n; p++)
+            {
+                if (!anc[p])
+                    continue;
+                F += (v[p] != 0.0) ? log1p(v[p] * dt / x[p]) / v[p] : dt / x[p];
+                dF += 1.0 / (x[p] + v[p] * dt);
+            }
+            if (F > 0.0)
+                hi = dt;
+            else
+                lo = dt;
+            if (fabs(F) <= 1.0e-15 * dtau || hi - lo <= 1.0e-15 * hi)
+                break;
+            double nd = dt - F / dF;
+            dt = (nd > lo && nd < hi) ? nd : 0.5 * (lo + hi);
+        }
+        for (int p = 0; p < n; p++)
+        {
+            if (!anc[p])
+                continue;
+            double xn = x[p] + v[p] * dt;
+            if (v[p] < 0.0)
+            {
+                double floor_k = x[p] * exp(v[p] * dtau); // dt <= this anchor's own single-anchor time
+                if (xn < floor_k)
+                    xn = floor_k;
+            }
+            x[p] = xn;
+        }
+    }
+    for (int p = 0; p < n; p++)
+    {
+        if (anc[p])
+            continue;
+        x[p] += v[p] * dt;
+        if (x[p] < 0.0)
+        {
+            x[p] = -x[p];
+            v[p] = -v[p];
+            if (ell[p] != 0.0 && !flip[p])
+            {
+                flip[p] = 1;
+                (*nflip)++;
+            }
+        }
+    }
+    return dt;
+}
+
+/**
+ * @brief Method 3: `sub` kick-drift-kick micro-steps over fictitious time htau from (x0, v0, t0), as in
+ *        doMicroLeviCivita. Writes x, v, *t_out; flags flips in flip[]. Returns the number of members that flipped.
+ */
+static int ssc_lc_micro(const int *mem, int n, const int *anc, const double *Rj, const double *x0, const double *v0,
+                        double t0, const double *ell, MencSource *src, double hs, double htau, int sub, double *x,
+                        double *v, double *t_out, double *a, int *flip)
+{
+    const double dtau = htau / (double)sub;
+    int nflip = 0;
+    double t = t0;
+    for (int p = 0; p < n; p++)
+    {
+        x[p] = x0[p];
+        v[p] = v0[p];
+        flip[p] = 0;
+    }
+    for (int ss = 0; ss < sub; ss++)
+    {
+        ssc_accel(mem, n, x, Rj, ell, src, hs, a);
+        double g = ssc_lc_g(n, anc, x);
+        for (int p = 0; p < n; p++)
+            v[p] += 0.5 * dtau * g * a[p];
+        t += ssc_lc_drift(n, anc, ell, x, v, dtau, flip, &nflip);
+        ssc_accel(mem, n, x, Rj, ell, src, hs, a);
+        g = ssc_lc_g(n, anc, x);
+        for (int p = 0; p < n; p++)
+            v[p] += 0.5 * dtau * g * a[p];
+    }
+    *t_out = t;
+    return nflip;
+}
+
+/** @brief Method 3: 1 if a cluster state is usable (finite, anchors at r > 0). */
+static int ssc_lc_state_ok(int n, const int *anc, const double *x, const double *v, double t)
+{
+    if (!ssc_finite(t))
+        return 0;
+    for (int p = 0; p < n; p++)
+        if (!ssc_finite(x[p]) || !ssc_finite(v[p]) || (anc[p] && !(x[p] > 0.0)))
+            return 0;
+    return 1;
+}
+
+/**
+ * @brief Method 3: one adaptive tau-step of fictitious length htau (doSingleTauStepAdaptiveLeviCivita for a cluster):
+ *        coarse 2N+1 against fine 4N+1 micro-steps, doubling N until every member meets the radius and velocity
+ *        tolerances and no member flips (a flip alone forces a doubling, counted in *forced). Writes x_out, v_out,
+ *        *t_out; flip_out[p] = 1 for members still flipping when the cap is reached. Returns 1 if converged.
+ *        Scratch: w (5n doubles), iw (n ints).
+ */
+static int ssc_lc_tau_step(const int *mem, int n, const int *anc, const double *Rj, const double *x_in,
+                           const double *v_in, double t_in, const double *ell, MencSource *src, double hs, double htau,
+                           double radius_tol, double velocity_tol, int max_subdiv, int out_type, double *x_out,
+                           double *v_out, double *t_out, int *flip_out, int *forced, double *w, int *iw)
+{
+    double *xc = w, *vc = w + n, *xf = w + 2 * n, *vf = w + 3 * n, *a = w + 4 * n;
+    int *fc = iw;
+    double tc, tf;
+    int N = 1, conv = 0;
+    int nfc = ssc_lc_micro(mem, n, anc, Rj, x_in, v_in, t_in, ell, src, hs, htau, 2 * N + 1, xc, vc, &tc, a, fc);
+    while (1)
+    {
+        int nff = ssc_lc_micro(mem, n, anc, Rj, x_in, v_in, t_in, ell, src, hs, htau, 4 * N + 1, xf, vf, &tf, a,
+                               flip_out);
+        int ok = ssc_lc_state_ok(n, anc, xf, vf, tf) && ssc_lc_state_ok(n, anc, xc, vc, tc);
+        double rd = 0.0, vd = 0.0;
+        for (int p = 0; ok && p < n; p++)
+        {
+            double r_diff = fabs(xf[p] - xc[p]) / (fabs(xf[p]) + 1.0e-30);
+            double vt = ell[p] / (fabs(xf[p]) + 1.0e-30);
+            double v_diff = fabs(vf[p] - vc[p]) / (sqrt(vf[p] * vf[p] + vt * vt) + 1.0e-30);
+            if (r_diff > rd) rd = r_diff;
+            if (v_diff > vd) vd = v_diff;
+        }
+        const int tol_ok = ok && rd < radius_tol && vd < velocity_tol;
+        if (tol_ok && nfc == 0 && nff == 0)
+        {
+            conv = 1;
+            break;
+        }
+        if (tol_ok)
+            (*forced)++; // a radius flip alone forces this doubling
+        if (N > max_subdiv / 2)
+            break;
+        memcpy(xc, xf, (size_t)n * sizeof(double));
+        memcpy(vc, vf, (size_t)n * sizeof(double));
+        tc = tf;
+        nfc = nff;
+        N *= 2;
+    }
+    // Output (doSingleTauStepAdaptiveLeviCivita's choice); Richardson falls back to the fine pass if it would leave a
+    // radius <= 0 or a non-finite value.
+    const double *xo = xf, *vo = vf;
+    double to = tf;
+    if (conv && out_type == 0)
+    {
+        xo = xc;
+        vo = vc;
+        to = tc;
+    }
+    memcpy(x_out, xo, (size_t)n * sizeof(double));
+    memcpy(v_out, vo, (size_t)n * sizeof(double));
+    *t_out = to;
+    if (conv && out_type == 2)
+    {
+        double nF2 = (4.0 * N + 1.0) * (4.0 * N + 1.0), nC2 = (2.0 * N + 1.0) * (2.0 * N + 1.0);
+        double wF = nF2 / (nF2 - nC2), wC = nC2 / (nF2 - nC2);
+        int good = 1;
+        for (int p = 0; p < n && good; p++)
+        {
+            x_out[p] = wF * xf[p] - wC * xc[p];
+            v_out[p] = wF * vf[p] - wC * vc[p];
+            good = x_out[p] > 0.0 && ssc_finite(x_out[p]) && ssc_finite(v_out[p]);
+        }
+        double tr = wF * tf - wC * tc;
+        if (good && ssc_finite(tr))
+            *t_out = tr;
+        else
+        {
+            memcpy(x_out, xf, (size_t)n * sizeof(double));
+            memcpy(v_out, vf, (size_t)n * sizeof(double));
+            *t_out = tf;
+#pragma omp atomic
+            g_ssc.neg_r++;
+        }
+    }
+    if (conv)
+        for (int p = 0; p < n; p++)
+            flip_out[p] = 0;
+    return conv;
+}
+
+/**
+ * @brief Method 3 core of ssc_lc_integrate: integrates (x, v) of the n members (in place) over physical time h in the
+ *        shared Levi-Civita time of the anchors, with enclosed-mass sources src. Also used by the unit test.
+ */
+static int ssc_lc_core(const int *mem, int n, const int *anc, const double *Rj, double *x, double *v, const double *ell,
+                       MencSource *src, double hs, double h, int N_taumin, double radius_tol, double velocity_tol,
+                       int max_subdiv, int out_type, int *flip, int *forced)
+{
+    double *buf = (double *)malloc((size_t)n * 7 * sizeof(double));
+    int *ibuf = (int *)malloc((size_t)n * 2 * sizeof(int));
+    if (!buf || !ibuf)
+    {
+        fprintf(stderr, "ERROR: Failed to allocate a --star-substep-method 3 cluster\n");
+        CLEAN_EXIT(1);
+    }
+    double *xn = buf, *vn = buf + n, *w = buf + 2 * n;
+    int *fl = ibuf, *iw = ibuf + n;
+    for (int p = 0; p < n; p++)
+        flip[p] = 0;
+    double t = 0.0;
+    const double g0 = ssc_lc_g(n, anc, x);
+    double dtau = (N_taumin > 0) ? h / (2.0 * g0 * N_taumin) : h / (100.0 * g0);
+    int conv = 1, n_retry = 0;
+    long long steps = 0;
+    while (t < h)
+    {
+        double tn;
+        int c = ssc_lc_tau_step(mem, n, anc, Rj, x, v, t, ell, src, hs, dtau, radius_tol, velocity_tol, max_subdiv,
+                                out_type, xn, vn, &tn, fl, forced, w, iw);
+        if (!ssc_lc_state_ok(n, anc, xn, vn, tn))
+        {
+            if (++n_retry <= LC_MAX_RETRY)
+            {
+                dtau *= 0.25;
+                continue;
+            }
+            conv = 0;
+            break; // keep the last good state
+        }
+        if (tn > h)
+        {
+            // Last tau-step: solve t(htau) = h by Newton (dt/dtau = g) safeguarded by bisection.
+            double lo = 0.0, hi = dtau, ht = dtau * (h - t) / (tn - t);
+            for (int it = 0; it < 60; it++)
+            {
+                c = ssc_lc_tau_step(mem, n, anc, Rj, x, v, t, ell, src, hs, ht, radius_tol, velocity_tol, max_subdiv,
+                                    out_type, xn, vn, &tn, fl, forced, w, iw);
+                double err = tn - h;
+                if (fabs(err) <= 1.0e-12 * h)
+                    break;
+                if (err > 0.0)
+                    hi = ht;
+                else
+                    lo = ht;
+                double hn = ht - err / ssc_lc_g(n, anc, xn);
+                ht = (hn > lo && hn < hi) ? hn : 0.5 * (lo + hi);
+            }
+            if (!c)
+                conv = 0;
+            for (int p = 0; p < n; p++)
+                flip[p] |= fl[p];
+            memcpy(x, xn, (size_t)n * sizeof(double));
+            memcpy(v, vn, (size_t)n * sizeof(double));
+            t = h;
+            break;
+        }
+        if (!c)
+            conv = 0;
+        for (int p = 0; p < n; p++)
+            flip[p] |= fl[p];
+        memcpy(x, xn, (size_t)n * sizeof(double));
+        memcpy(v, vn, (size_t)n * sizeof(double));
+        t = tn;
+        if (++steps > 100000000LL)
+        {
+            conv = 0;
+            break;
+        }
+    }
+    free(buf);
+    free(ibuf);
+    return conv;
+}
+
+/**
+ * @brief Method 3: joint integration of one cluster over the sub-step h in the shared Levi-Civita time of its
+ *        anchors (anc[p] = 1), from the start-of-sub-step states (doAdaptiveFullLeviCivita for a cluster). Writes Rn,
+ *        g_ss_v. flip[p] = 1 for non-anchors that still flipped at the cap in some tau-step; *forced counts the
+ *        doublings a flip alone forced. Returns 1 if every tau-step converged.
+ */
+static int ssc_lc_integrate(const int *mem, int n, const int *anc, const double *Rj, double *Rn, const StarProfile *PF,
+                            double h, int N_taumin, double radius_tol, double velocity_tol, int max_subdiv,
+                            int out_type, int *flip, int *forced)
+{
+    MencSource *src = (MencSource *)malloc((size_t)n * sizeof(MencSource));
+    double *buf = (double *)malloc((size_t)n * 3 * sizeof(double));
+    if (!src || !buf)
+    {
+        fprintf(stderr, "ERROR: Failed to allocate a --star-substep-method 3 cluster\n");
+        CLEAN_EXIT(1);
+    }
+    double *ell = buf, *x = buf + n, *v = buf + 2 * n;
+    for (int p = 0; p < n; p++)
+    {
+        int q = mem[p];
+        src[p] = menc_source_split(g_ss_rank[q], Rj[q], 0.0, PF, q);
+        src[p].t = 0.0;
+        x[p] = Rj[q];
+        v[p] = g_ssc_v0[q];
+        ell[p] = g_ssc_ell0[q];
+    }
+    int conv = ssc_lc_core(mem, n, anc, Rj, x, v, ell, src, PF->soft_h, h, N_taumin, radius_tol, velocity_tol,
+                           max_subdiv, out_type, flip, forced);
+    for (int p = 0; p < n; p++)
+    {
+        int q = mem[p];
+        Rn[q] = x[p];
+        g_ss_v[q] = v[p];
+        g_ss_ell[q] = ell[p];
+    }
+    free(src);
+    free(buf);
+    return conv;
+}
+
+/** @brief Logs a joint integration with a radius flip (log file always; stderr for the first 10 of a run). */
+static void ssc_log_flip(int jsub, int n, const char *path, int forced, int nflip_left, const char *outcome)
+{
+#pragma omp critical(ssc_flip_log)
+    {
+        g_ssc.flip_integrations++;
+        g_ssc.flip_doublings += forced;
+        if (nflip_left > 0)
+            g_ssc.flip_unresolved++;
+        log_message("WARNING", "--star-substep-method %d: radius flip (a member with L > 0 drifted through r = 0) at "
+                    "step %d, sub-step %d, cluster of %d, %s path: %d doubling(s) of N forced, %d member(s) still "
+                    "flipping at the cap; %s", g_star_substep_method, g_ssc_step, jsub, n, path, forced, nflip_left,
+                    outcome);
+        if (g_ssc.flip_logged < 10)
+        {
+            fprintf(stderr, "Warning: --star-substep-method %d radius flip at step %d, sub-step %d (cluster of %d, %s "
+                    "path): %d doubling(s) forced, %d still flipping at the cap; %s%s\n", g_star_substep_method,
+                    g_ssc_step, jsub, n, path, forced, nflip_left, outcome,
+                    g_ssc.flip_logged == 9 ? " (further flips go to the log file only)" : "");
+            g_ssc.flip_logged++;
+        }
+    }
+}
+
+/**
+ * @brief Integrates one cluster jointly (methods 2 and 3). Method 2: physical time (ssc_integrate). Method 3: shared
+ *        Levi-Civita time (ssc_lc_integrate) if a member's first pass used the Levi-Civita branch; otherwise physical
+ *        time, and members that still flip at its cap become anchors of a Levi-Civita integration. In the
+ *        Levi-Civita path, non-anchors still flipping at the cap are promoted and the cluster is redone (at most n
+ *        times). Returns 1 if the accepted integration converged.
+ */
+static int ssc_cluster(const int *mem, int n, int jsub, const double *Rj, double *Rn, const StarProfile *PF, double h,
+                       int N_taumin, double radius_tol, double velocity_tol, int max_subdiv, int out_type)
+{
+    int *anc = (int *)malloc((size_t)n * 2 * sizeof(int));
+    if (!anc)
+    {
+        fprintf(stderr, "ERROR: Failed to allocate a --star-substep-method cluster\n");
+        CLEAN_EXIT(1);
+    }
+    int *flip = anc + n;
+    int na = 0, conv = 1;
+    for (int p = 0; p < n; p++)
+    {
+        anc[p] = (g_star_substep_method == 3) && g_ssc_lc[mem[p]];
+        na += anc[p];
+    }
+    if (na == 0)
+    {
+        int forced = 0, nfl = 0;
+        conv = ssc_integrate(mem, n, Rj, Rn, PF, h, radius_tol, velocity_tol, max_subdiv, out_type, flip, &forced);
+        for (int p = 0; p < n; p++)
+            nfl += flip[p];
+        if (!conv && nfl == 0 && g_star_substep_method == 3)
+        {
+            // Not converged without a flip (e.g. a member passing its pericentre inside the sub-step, where uniform
+            // steps under-resolve the barrier): redo with every member as an anchor.
+            for (int p = 0; p < n; p++)
+                anc[p] = 1;
+            na = n;
+#pragma omp atomic
+            g_ssc.promoted_nonconv++;
+        }
+        if (forced > 0 || nfl > 0)
+        {
+            if (nfl > 0 && g_star_substep_method == 3)
+            {
+                for (int p = 0; p < n; p++)
+                    if (flip[p])
+                    {
+                        anc[p] = 1;
+                        na++;
+                    }
+#pragma omp atomic
+                g_ssc.promoted += nfl;
+            }
+            ssc_log_flip(jsub, n, "physical-time", forced, nfl,
+                         nfl == 0 ? "resolved by finer steps"
+                                  : (g_star_substep_method == 3 ? "flipping members promoted to Levi-Civita anchors"
+                                                                : "accepted unresolved"));
+        }
+    }
+    if (na > 0)
+    {
+#pragma omp atomic
+        g_ssc.lc_path++;
+        int multi = 0;
+        for (int round = 0; round <= n; round++)
+        {
+            int forced = 0, nfl = 0, na_now = 0;
+            for (int p = 0; p < n; p++)
+                na_now += anc[p];
+            if (na_now >= 2)
+                multi = 1;
+            conv = ssc_lc_integrate(mem, n, anc, Rj, Rn, PF, h, N_taumin, radius_tol, velocity_tol, max_subdiv,
+                                    out_type, flip, &forced);
+            for (int p = 0; p < n; p++)
+                nfl += flip[p];
+            if (forced > 0 || nfl > 0)
+                ssc_log_flip(jsub, n, "Levi-Civita", forced, nfl,
+                             nfl == 0 ? "resolved by finer steps"
+                                      : (round < n ? "flipping members promoted to anchors, cluster redone"
+                                                   : "accepted unresolved"));
+            if (nfl == 0 && !conv && na_now < n && round < n)
+            {
+                // Not converged without a flip: a non-anchor passing its own pericentre in the sub-step. Redo with
+                // every member as an anchor.
+                for (int p = 0; p < n; p++)
+                    anc[p] = 1;
+#pragma omp atomic
+                g_ssc.promoted_nonconv++;
+                continue;
+            }
+            if (nfl == 0 || round == n)
+                break;
+            for (int p = 0; p < n; p++)
+                if (flip[p] && !anc[p])
+                    anc[p] = 1;
+#pragma omp atomic
+            g_ssc.promoted += nfl;
+        }
+        if (multi)
+        {
+#pragma omp atomic
+            g_ssc.lc_multi++;
+        }
+    }
+    free(anc);
+    return conv;
+}
+
+/**
+ * @brief --star-substep-method 2 and 3: after the first pass of sub-step `jsub` (radii Rj -> Rn, velocities in g_ss_v),
+ *        re-integrates jointly every cluster of stars whose radial sweeps overlap, redoing grown clusters up to
+ *        STAR_SSC_MAX_REDOS times. Sets g_ssc_joint (cluster label per jointly integrated star, else -1).
+ */
+static void star_substep_clusters(int jsub, const double *Rj, double *Rn, const StarProfile *PF, double h,
+                                  double radius_tol, double velocity_tol, int max_subdiv, int N_taumin, int out_type)
+{
+    const int ns = g_ss_ns;
+    const double hs = PF->soft_h;
+    const double t0 = omp_get_wtime();
+    int nlab = 0, any = 0, round;
+    for (int q = 0; q < ns; q++)
+    {
+        g_ssc_lab[q] = -1;
+        g_ssc_joint[q] = -1;
+        g_ssc_uf[q] = q;
+    }
+    for (round = 0;; round++)
+    {
+        // Radial sweeps of all stars in this sub-step, widened by the band of smooth shell interaction.
+        for (int q = 0; q < ns; q++)
+        {
+            double lo = Rj[q] < Rn[q] ? Rj[q] : Rn[q];
+            double hi = Rj[q] < Rn[q] ? Rn[q] : Rj[q];
+            g_ssc_lo[q] = lo - ((hs > 0.0) ? hs : STAR_SHELL_SOFTENING * fabs(lo));
+            g_ssc_hi[q] = hi + ((hs > 0.0) ? hs : STAR_SHELL_SOFTENING * fabs(hi));
+            g_ssc_keys[q].key = g_ssc_lo[q];
+            g_ssc_keys[q].idx = q;
+        }
+        qsort(g_ssc_keys, (size_t)ns, sizeof(StarKey), star_key_cmp);
+        // Runs (in radius order) of overlapping sweeps are merged into the clusters of the earlier rounds of this
+        // sub-step (union-find), so clusters only grow: a re-integrated cluster whose sweeps no longer overlap is
+        // never split again, which would let it flip between two memberships until the redo limit.
+        for (int k = 0; k < ns;)
+        {
+            double top = g_ssc_hi[g_ssc_keys[k].idx];
+            k++;
+            while (k < ns && g_ssc_lo[g_ssc_keys[k].idx] <= top)
+            {
+                if (g_ssc_hi[g_ssc_keys[k].idx] > top)
+                    top = g_ssc_hi[g_ssc_keys[k].idx];
+                ssc_union(g_ssc_keys[k - 1].idx, g_ssc_keys[k].idx);
+                k++;
+            }
+        }
+        // Clusters = union-find components of two or more stars (members in star-index order).
+        for (int q = 0; q < ns; q++)
+        {
+            g_ssc_root[q] = ssc_find(q);
+            g_ssc_cnt[q] = 0;
+        }
+        for (int q = 0; q < ns; q++)
+            g_ssc_cnt[g_ssc_root[q]]++;
+        int ncl = 0, nmem = 0, nredo = 0;
+        for (int q = 0; q < ns; q++)
+        {
+            if (g_ssc_cnt[q] >= 2)
+            {
+                g_ssc_off[q] = ncl;
+                g_ssc_cl_start[ncl] = nmem;
+                g_ssc_cl_size[ncl] = 0;
+                nmem += g_ssc_cnt[q];
+                ncl++;
+            }
+            else
+                g_ssc_off[q] = -1;
+        }
+        for (int q = 0; q < ns; q++)
+        {
+            int c = g_ssc_off[g_ssc_root[q]];
+            if (c >= 0)
+                g_ssc_mem[g_ssc_cl_start[c] + g_ssc_cl_size[c]++] = q;
+        }
+        for (int c = 0; c < ncl; c++)
+        {
+            // Unchanged if all members were handled together in a cluster of exactly this size.
+            const int *mem = g_ssc_mem + g_ssc_cl_start[c];
+            const int sz = g_ssc_cl_size[c];
+            int L = g_ssc_lab[mem[0]];
+            int same = (L >= 0) && (g_ssc_labsize[L] == sz);
+            for (int t = 0; same && t < sz; t++)
+                same = (g_ssc_lab[mem[t]] == L);
+            g_ssc_cl_redo[c] = !same;
+            nredo += !same;
+        }
+        if (ncl > 0)
+            any = 1;
+        if (nredo == 0)
+            break;
+        if (round > STAR_SSC_MAX_REDOS)
+        {
+            log_message("WARNING", "--star-substep-method 2/3: cluster redo limit (%d) reached at step %d, sub-step %d "
+                        "(%d of %d clusters still growing); keeping the current states",
+                        STAR_SSC_MAX_REDOS, g_ssc_step, jsub, nredo, ncl);
+            if (g_ssc.cap_logged < 10)
+            {
+                fprintf(stderr, "Warning: --star-substep-method 2/3 cluster redo limit (%d) reached at step %d, sub-step %d "
+                        "(%d of %d clusters still growing); keeping the current states%s\n",
+                        STAR_SSC_MAX_REDOS, g_ssc_step, jsub, nredo, ncl,
+                        g_ssc.cap_logged == 9 ? " (further hits are only counted)" : "");
+                g_ssc.cap_logged++;
+            }
+            break;
+        }
+        // Label the clusters to (re)do; skip those the joint pass cannot integrate.
+        for (int c = 0; c < ncl; c++)
+        {
+            if (!g_ssc_cl_redo[c])
+                continue;
+            const int *mem = g_ssc_mem + g_ssc_cl_start[c];
+            const int sz = g_ssc_cl_size[c];
+            int lab = nlab++;
+            g_ssc_labsize[lab] = sz;
+            int lc = 0, drag = 0;
+            for (int t = 0; t < sz; t++)
+            {
+                g_ssc_lab[mem[t]] = lab;
+                lc |= g_ssc_lc[mem[t]];
+                drag |= g_ss_drag_on[mem[t]];
+            }
+            if (lc)
+                g_ssc.lc_clusters++; // method 2: physical time like the others; method 3: shared Levi-Civita time
+            if (drag)
+            {
+                g_ssc_cl_redo[c] = 2;
+                g_ssc.skip_drag++;
+                for (int t = 0; t < sz; t++)
+                    g_ssc_joint[mem[t]] = -1;
+            }
+            else
+            {
+                for (int t = 0; t < sz; t++)
+                    g_ssc_joint[mem[t]] = lab;
+                g_ssc.clusters++;
+                g_ssc.star_integrations += sz;
+                g_ssc.size_hist[sz == 2 ? 0 : sz == 3 ? 1 : sz == 4 ? 2 : sz <= 8 ? 3 : sz <= 16 ? 4 : 5]++;
+                if (sz > g_ssc.max_size)
+                    g_ssc.max_size = sz;
+            }
+        }
+        long long nonconv = 0;
+#pragma omp parallel for default(shared) schedule(dynamic, 1) reduction(+:nonconv)
+        for (int c = 0; c < ncl; c++)
+        {
+            if (g_ssc_cl_redo[c] != 1)
+                continue;
+            if (!ssc_cluster(g_ssc_mem + g_ssc_cl_start[c], g_ssc_cl_size[c], jsub, Rj, Rn, PF, h, N_taumin, radius_tol,
+                             velocity_tol, max_subdiv, out_type))
+                nonconv++;
+        }
+        g_ssc.nonconv += nonconv;
+    }
+    if (any)
+    {
+        g_ssc.substeps++;
+        g_ssc.redo_hist[round > STAR_SSC_MAX_REDOS ? STAR_SSC_MAX_REDOS + 1 : (round > 0 ? round - 1 : 0)]++;
+    }
+    g_ssc.time_total += omp_get_wtime() - t0;
+}
+
+/**
+ * @brief Integrates the stars over one step in M sub-steps and builds the star shells the dark
+ *        matter sees (--star-substeps).
+ * @details Each sub-step of length dt/M integrates every star with the same integrators and
+ *          branch choice as the main loop, in the dark-matter-only table of the start of the step
+ *          plus the other stars frozen at the start of the sub-step (its own shell excluded).
+ *          Drag (if on for the star this step) acts in every sub-step and its energy is summed.
+ *          The star radii at the M+1 sub-step boundaries become M intervals in g_ss_profile; the
+ *          stars' final states are written back to `particles`, and their drag energy to
+ *          drag_dE_rank. Must run after the sort, the drag snapshots and SIDM, before the
+ *          dark-matter loop.
+ */
+static void run_star_substeps(double **particles, int npts, double dt, int M, double alpha_param,
+                              double radius_tol, double velocity_tol, int max_subdiv, int N_taumin, int out_type)
+{
+    const int ns = g_ss_ns;
+    g_ss_profile.ns = ns;
+    if (ns == 0)
+        return;
+
+    int st = 0;
+    double m_total = 0.0;
+    for (int i = 0; i < npts; i++)
+    {
+        if (particles[P_SPECIES][i] == 0)
+            continue;
+        g_ss_rank[st] = i;
+        g_ss_m[st] = particles[P_MASS][i];
+        g_ss_R[st] = particles[0][i];
+        g_ss_v[st] = particles[1][i];
+        g_ss_ell[st] = particles[2][i];
+        g_ss_edrag[st] = 0.0;
+        // Same per-step drag conditions as the main loop (see there).
+        g_ss_drag_on[st] = g_enable_drag_force && dm_menc_snapshot[i] >= particles[P_MASS][i] &&
+                           fabs(particles[2][i]) >= lmin_snapshot[i];
+        m_total += particles[P_MASS][i];
+        st++;
+    }
+
+    const double h = dt / (double)M;
+    StarInterval *F = &g_ss_iv[M]; // frozen scratch interval
+    StarProfile PF;
+    PF.ns = ns;
+    PF.n_iv = 1;
+    PF.h_sub = 0.0;
+    PF.m = g_ss_m;
+    PF.iv = F;
+    PF.m_total = m_total;
+    PF.soft_h = star_soft_h_kpc();
+
+    for (int j = 0; j < M; j++)
+    {
+        const double *Rj = g_ss_R + (size_t)j * ns;
+        double *Rn = g_ss_R + (size_t)(j + 1) * ns;
+        build_star_interval(F, Rj, Rj, g_ss_m, ns, g_ss_keys, PF.soft_h);
+        if (g_star_substep_method >= 2)
+        {
+            memcpy(g_ssc_v0, g_ss_v, (size_t)ns * sizeof(double));
+            memcpy(g_ssc_ell0, g_ss_ell, (size_t)ns * sizeof(double));
+        }
+
+#pragma omp parallel for default(shared) schedule(dynamic, 1)
+        for (int q = 0; q < ns; q++)
+        {
+            int i = g_ss_rank[q];
+            double r = Rj[q];
+            double v = g_ss_v[q];
+            double ell = g_ss_ell[q];
+
+            double r_crit = 0.0;
+            if (fabs(ell) > 1.0e-30)
+            {
+                double M_enc = (i == 0) ? 0.1 * particles[P_MASS][0] : g_mass_prefix_sum[i];
+                double gravPart = (VEL_CONV_SQ * G_CONST) * M_enc;
+                r_crit = (ell * ell) * alpha_param / gravPart;
+            }
+
+            MencSource msrc = menc_source_split(i, r, 0.0, &PF, q);
+
+            DragSource dsrc;
+            const DragSource *drag = NULL;
+            if (g_ss_drag_on[q])
+            {
+                dsrc.rank = i;
+                dsrc.particles = particles;
+                dsrc.rho_snapshot = rho_snapshot;
+                dsrc.vdm_sq_snapshot = vdm_sq_snapshot;
+                dsrc.bmax_snapshot = bmax_snapshot;
+                dsrc.G_value = G_CONST;
+                drag = &dsrc;
+            }
+
+            int lc_radial = 0;
+            if (g_enable_drag_force && i > 0)
+            {
+                double L_circ_sq = (VEL_CONV_SQ * G_CONST) * g_mass_prefix_sum[i] * r;
+                lc_radial = ell * ell < 0.01 * L_circ_sq;
+            }
+
+            double r_new, v_new, ell_new, edrag_new;
+            if (r > 1.0e-30 && (r < r_crit || lc_radial))
+                doAdaptiveFullLeviCivita(&msrc, r, v, ell, h, N_taumin, radius_tol, velocity_tol, max_subdiv,
+                                         G_CONST, out_type, drag, &r_new, &v_new, &ell_new, &edrag_new);
+            else
+                doAdaptiveFullLeap(&msrc, r, v, ell, h, radius_tol, velocity_tol, max_subdiv,
+                                   G_CONST, out_type, drag, &r_new, &v_new, &ell_new, &edrag_new);
+            if (g_star_substep_method >= 2)
+                g_ssc_lc[q] = (r > 1.0e-30 && (r < r_crit || lc_radial));
+            Rn[q] = r_new;
+            g_ss_v[q] = v_new;
+            g_ss_ell[q] = ell_new;
+            g_ss_edrag[q] += edrag_new;
+        }
+        if (g_star_substep_method >= 2)
+            star_substep_clusters(j, Rj, Rn, &PF, h, radius_tol, velocity_tol, max_subdiv, N_taumin, out_type);
+    }
+
+    const double *Rend = g_ss_R + (size_t)M * ns;
+    for (int q = 0; q < ns; q++)
+    {
+        int i = g_ss_rank[q];
+        particles[0][i] = Rend[q];
+        particles[1][i] = g_ss_v[q];
+        particles[2][i] = g_ss_ell[q];
+        if (g_enable_drag_force)
+            drag_dE_rank[i] = g_ss_drag_on[q] ? g_ss_m[q] * g_ss_edrag[q] : 0.0;
+    }
+
+    for (int j = 0; j < M; j++)
+        build_star_interval(&g_ss_iv[j], g_ss_R + (size_t)j * ns, g_ss_R + (size_t)(j + 1) * ns, g_ss_m, ns, g_ss_keys, 0.0);
+    g_ss_profile.ns = ns;
+    g_ss_profile.n_iv = M;
+    g_ss_profile.h_sub = h;
+    g_ss_profile.m = g_ss_m;
+    g_ss_profile.iv = g_ss_iv;
+    g_ss_profile.m_total = m_total;
+    g_ss_profile.soft_h = 0.0; // the dark matter sees the unsoftened star shells
 }
 
 // =============================================================================
@@ -4196,18 +7126,17 @@ static const char *writeInitFilename = NULL; ///< Filename to write initial cond
  *          original index, orientation parameter \f$\mu\f$) and the particle count (`npts`)
  *          to a binary file for later retrieval via `read_initial_conditions`.
  *          Opens the file in write binary mode ("wb"). First writes the integer `npts`,
- *          then writes the 5 double-precision values for each particle sequentially.
+ *          then writes the 9 double-precision values for each particle sequentially.
  *
- * @param particles [in] 2D array containing particle properties [component][particle_index]. Expected components: 0=rad, 1=vel, 2=angmom, 3=orig_idx, 4=mu.
+ * @param particles [in] 2D array containing particle properties [component][particle_index] (see P_SPECIES, P_MASS).
  * @param npts [in] Number of particles to write.
  * @param filename [in] Path to the output binary file.
  *
  * @note The binary file format is: `npts` (int32), followed by `npts` records,
- *       each consisting of 10 `double` values:
- *       (radius, velocity, ang. mom., orig. index, mu, cos_phi, sin_phi, species, mass, reserved).
+ *       each consisting of 9 `double` values:
+ *       (radius, velocity, ang. mom., orig. index, mu, cos_phi, sin_phi, species, mass).
  *       cos_phi and sin_phi are the cosine and sine of the azimuthal angle used for SIDM scattering.
- *       species and mass were added as part of the baryon model additions.
- *       reserved is an empty field for easier future additions.
+ *       species is 0 for dark matter; mass is the particle mass in Msun.
  * @warning Prints an error to stderr if the file cannot be opened.
  *
  * @see read_initial_conditions
@@ -4233,9 +7162,8 @@ static void write_initial_conditions(double **particles, int npts, const char *f
         double mu_val = particles[4][i];
         double cos_phi_val = particles[5][i];  // cos(phi)
         double sin_phi_val = particles[6][i];  // sin(phi)
-        double species = particles[7][i];      // dark matter = 0, baryon = 1
-        double mass = particles[8][i];         // mass
-        double reserved = particles[9][i];     // reserved for future use
+        double species_val = particles[P_SPECIES][i];
+        double mass_val = particles[P_MASS][i];
 
         fwrite(&r_val, sizeof(double), 1, fp);
         fwrite(&v_val, sizeof(double), 1, fp);
@@ -4244,13 +7172,157 @@ static void write_initial_conditions(double **particles, int npts, const char *f
         fwrite(&mu_val, sizeof(double), 1, fp);
         fwrite(&cos_phi_val, sizeof(double), 1, fp);
         fwrite(&sin_phi_val, sizeof(double), 1, fp);
-        fwrite(&species, sizeof(double), 1, fp);
-        fwrite(&mass, sizeof(double), 1, fp);
-        fwrite(&reserved, sizeof(double), 1, fp);
+        fwrite(&species_val, sizeof(double), 1, fp);
+        fwrite(&mass_val, sizeof(double), 1, fp);
     }
 
     fclose(fp);
     log_message("INFO", "Wrote initial conditions (%d particles) to '%s'", npts, filename);
+}
+
+/**
+ * @brief True if `x` is a finite double (not NaN or +-inf).
+ * @details Tests the IEEE-754 exponent bits directly, because nsphere is built with
+ *          -ffast-math, under which isfinite()/isnan() may be optimised away.
+ */
+static inline int is_finite_double(double x)
+{
+    uint64_t bits;
+    memcpy(&bits, &x, sizeof(bits));
+    return ((bits >> 52) & 0x7FF) != 0x7FF;
+}
+
+/**
+ * @brief Checks loaded initial conditions against physical and format expectations.
+ * @details Run by read_initial_conditions after loading. Every check is applied to every
+ *          particle; for each check that fails, a warning gives the number of offending
+ *          particles and the first few of them. If any check fails, the run stops. Checks:
+ *          - r: finite and > 0.
+ *          - v (total speed, km/s): finite and >= 0.
+ *          - L: finite and |L| <= r v (1 + 1e-6), since |L| = r v sqrt(1 - mu^2).
+ *          - ID: an integer in [0, npts), each value used once.
+ *          - mu: finite and in [-1, 1].
+ *          - cos_phi, sin_phi: finite, with cos^2 + sin^2 within 1e-6 of 1.
+ *          - species: a finite, non-negative integer.
+ *          - mass: finite and > 0.
+ *          - total mass (9/10-field files): within 1e-6 (relative) of `default_mass * npts`,
+ *            i.e. --halo-mass scaled by the number of particles in the file (which exceeds
+ *            --nparticles by the share later removed by --ftidal).
+ *          A layout misread (e.g. a damaged file whose size happens to match another layout)
+ *          misaligns the records and fails these checks immediately.
+ *
+ * @param particles    [in] Loaded particle array.
+ * @param npts         [in] Number of particles in the file.
+ * @param filename     [in] File name, for messages.
+ * @param nfields      [in] Record length detected (7, 9 or 10).
+ * @param default_mass [in] Mass per particle implied by --halo-mass (Msun).
+ */
+static void validate_initial_conditions(double **particles, int npts, const char *filename,
+                                        int nfields, double default_mass)
+{
+    enum { C_R, C_V, C_L, C_ID, C_MU, C_PHI, C_SPECIES, C_MASS, N_CHECKS };
+    static const char *what[N_CHECKS] = {
+        "radius r must be finite and > 0",
+        "speed v must be finite and >= 0",
+        "angular momentum must be finite with |L| <= r*v",
+        "ID must be an integer in [0, npts) used only once",
+        "mu must be finite and in [-1, 1]",
+        "cos_phi^2 + sin_phi^2 must be 1 (within 1e-6)",
+        "species must be a finite non-negative integer",
+        "mass must be finite and > 0",
+    };
+    const int max_listed = 5;
+    long long count[N_CHECKS] = {0};
+    int listed[N_CHECKS][5];
+
+    unsigned char *id_seen = (unsigned char *)calloc((size_t)npts, 1);
+    if (!id_seen)
+    {
+        fprintf(stderr, "Error: failed to allocate ID check buffer for '%s'.\n", filename);
+        CLEAN_EXIT(1);
+    }
+
+    double total_mass = 0.0;
+    for (int i = 0; i < npts; i++)
+    {
+        double r = particles[0][i], v = particles[1][i], L = particles[2][i];
+        double id = particles[3][i], mu = particles[4][i];
+        double c = particles[5][i], sn = particles[6][i];
+        double sp = particles[P_SPECIES][i], m = particles[P_MASS][i];
+        int bad[N_CHECKS] = {0};
+
+        bad[C_R] = !(is_finite_double(r) && r > 0.0);
+        bad[C_V] = !(is_finite_double(v) && v >= 0.0);
+        bad[C_L] = !(is_finite_double(L) && (bad[C_R] || bad[C_V] || fabs(L) <= r * v * (1.0 + 1.0e-6)));
+        if (is_finite_double(id) && id == floor(id) && id >= 0.0 && id < (double)npts)
+        {
+            int k = (int)id;
+            if (id_seen[k])
+                bad[C_ID] = 1;
+            id_seen[k] = 1;
+        }
+        else
+        {
+            bad[C_ID] = 1;
+        }
+        bad[C_MU] = !(is_finite_double(mu) && mu >= -1.0 && mu <= 1.0);
+        bad[C_PHI] = !(is_finite_double(c) && is_finite_double(sn) && fabs(c * c + sn * sn - 1.0) <= 1.0e-6);
+        bad[C_SPECIES] = !(is_finite_double(sp) && sp >= 0.0 && sp == floor(sp));
+        bad[C_MASS] = !(is_finite_double(m) && m > 0.0);
+        if (!bad[C_MASS])
+            total_mass += m;
+
+        for (int k = 0; k < N_CHECKS; k++)
+        {
+            if (bad[k])
+            {
+                if (count[k] < max_listed)
+                    listed[k][count[k]] = i;
+                count[k]++;
+            }
+        }
+    }
+    free(id_seen);
+
+    long long n_failed_checks = 0;
+    for (int k = 0; k < N_CHECKS; k++)
+    {
+        if (count[k] == 0)
+            continue;
+        n_failed_checks++;
+        fprintf(stderr, "WARNING: '%s': %lld particle(s) fail: %s.\n", filename, count[k], what[k]);
+        for (int q = 0; q < count[k] && q < max_listed; q++)
+        {
+            int i = listed[k][q];
+            fprintf(stderr, "           particle %d: r=%g v=%g L=%g ID=%g mu=%g cos_phi=%g sin_phi=%g species=%g mass=%g\n",
+                    i, particles[0][i], particles[1][i], particles[2][i], particles[3][i], particles[4][i],
+                    particles[5][i], particles[6][i], particles[P_SPECIES][i], particles[P_MASS][i]);
+        }
+        if (count[k] > max_listed)
+            fprintf(stderr, "           ... and %lld more\n", count[k] - max_listed);
+    }
+
+    // Total mass vs --halo-mass (only meaningful when the file carries its own masses).
+    if (nfields >= 9 && count[C_MASS] == 0)
+    {
+        double expected = default_mass * (double)npts;
+        double rel = fabs(total_mass - expected) / expected;
+        if (!(rel <= 1.0e-6))
+        {
+            n_failed_checks++;
+            fprintf(stderr, "WARNING: '%s': particle masses sum to %.10g Msun, but --halo-mass implies %.10g Msun\n"
+                            "         for %d particles (relative difference %.3e). Set --halo-mass to the mass of the\n"
+                            "         retained particles so the theoretical profiles match the simulated system.\n",
+                    filename, total_mass, expected, npts, rel);
+        }
+    }
+
+    if (n_failed_checks > 0)
+    {
+        fprintf(stderr, "Error: initial conditions in '%s' (%d-field records) failed %lld check(s); stopping.\n",
+                filename, nfields, n_failed_checks);
+        CLEAN_EXIT(1);
+    }
 }
 
 /**
@@ -4261,17 +7333,25 @@ static void write_initial_conditions(double **particles, int npts, const char *f
  *          particles read from the file matches the expected count `npts`.
  *          Opens the file in read binary mode ("rb").
  *
- * @param particles [out] 2D array to store loaded particle properties [component][particle_index]. Must be pre-allocated with dimensions [N_PARTICLE_PARAMS][npts].
- * @param npts [in] Expected number of particles to read.
- * @param filename [in] Path to the input binary file.
+ * @param particles    [out] 2D array to store loaded particle properties [component][particle_index]. Must be pre-allocated with dimensions [N_PARTICLE_FIELDS][npts].
+ * @param npts         [in] Expected number of particles to read.
+ * @param filename     [in] Path to the input binary file.
+ * @param default_mass [in] Particle mass (Msun) assigned when the file carries no masses (7-field format).
  *
- * @note Expects N_PARTICLE_PARAMS variables per particle. See `write_initial_conditions` for file format details.
- * @warning Prints an error to stderr if the file cannot be opened, if the particle
- *          count does not match `npts` (returns early), or if a read error occurs.
+ * @note The record length is detected from the file size, so three layouts are accepted:
+ *       - 9 doubles (current): r, v, L, ID, mu, cos_phi, sin_phi, species, mass.
+ *       - 10 doubles: as above plus one reserved value (ignored), e.g. from nsphere_ic_gen_v2.py.
+ *       - 7 doubles (legacy): r, v, L, ID, mu, cos_phi, sin_phi; species is set to 0 and the mass
+ *         to `default_mass` for every particle.
+ *       See `write_initial_conditions` for the meaning of each field.
+ * @warning Exits if the file cannot be opened, if the particle count does not match `npts`,
+ *          if the file size matches none of the layouts, if a read error occurs, or if any
+ *          value fails the checks in validate_initial_conditions.
  *
  * @see write_initial_conditions
+ * @see validate_initial_conditions
  */
-static void read_initial_conditions(double **particles, int npts, const char *filename)
+static void read_initial_conditions(double **particles, int npts, const char *filename, double default_mass)
 {
     FILE *fp = fopen(filename, "rb");
     if (!fp)
@@ -4294,75 +7374,148 @@ static void read_initial_conditions(double **particles, int npts, const char *fi
         CLEAN_EXIT(1);
     }
 
+    // Detect the record length (7, 9 or 10 doubles per particle) from the file size.
+    fseek(fp, 0, SEEK_END);
+    long long file_size = (long long)ftell(fp);
+    fseek(fp, (long)sizeof(int), SEEK_SET);
+    long long payload = file_size - (long long)sizeof(int);
+    int nfields = 0;
+    const int candidates[3] = {9, 10, 7};
+    for (int c = 0; c < 3; c++)
+    {
+        if (npts > 0 && payload == (long long)npts * candidates[c] * (long long)sizeof(double))
+        {
+            nfields = candidates[c];
+            break;
+        }
+    }
+    if (nfields == 0)
+    {
+        fprintf(stderr, "Error: '%s' has %lld bytes of particle data, which matches none of the supported\n"
+                        "       layouts for npts=%d: 7 (r, v, L, ID, mu, cos_phi, sin_phi), 9 (+ species, mass)\n"
+                        "       or 10 (+ species, mass, reserved) doubles per particle.\n",
+                filename, payload, npts);
+        fclose(fp);
+        CLEAN_EXIT(1);
+    }
+
     for (int i = 0; i < npts; i++)
     {
-        double r_val, v_val, ell_val, idx_val, mu_val, cos_phi_val, sin_phi_val, species, mass, reserved;
-        if (fread(&r_val, sizeof(double), 1, fp) != 1 || fread(&v_val, sizeof(double), 1, fp) != 1 || fread(&ell_val, sizeof(double), 1, fp) != 1 || fread(&idx_val, sizeof(double), 1, fp) != 1 || fread(&mu_val, sizeof(double), 1, fp) != 1 || fread(&cos_phi_val, sizeof(double), 1, fp) != 1 || fread(&sin_phi_val, sizeof(double), 1, fp) != 1 || fread(&species, sizeof(double), 1, fp) != 1 || fread(&mass, sizeof(double), 1, fp) != 1 || fread(&reserved, sizeof(double), 1, fp) != 1)
+        double rec[10];
+        if (fread(rec, sizeof(double), (size_t)nfields, fp) != (size_t)nfields)
         {
-            fprintf(stderr, "Error: partial read at i=%d in '%s'. File must use N_PARTICLE_PARAMS-variable format (r, v, L, ID, mu, cos_phi, sin_phi, species, mass, reserved).\n", i, filename);
+            fprintf(stderr, "Error: partial read at i=%d in '%s' (%d-field records).\n", i, filename, nfields);
             fclose(fp);
             CLEAN_EXIT(1);
         }
 
-        particles[0][i] = r_val;
-        particles[1][i] = v_val;
-        particles[2][i] = ell_val;
-        particles[3][i] = idx_val;
-        particles[4][i] = mu_val;
-        particles[5][i] = cos_phi_val;  // cos(phi)
-        particles[6][i] = sin_phi_val;   // sin(phi)
-        particles[7][i] = species;
-        particles[8][i] = mass;
-        particles[9][i] = reserved;
-
+        particles[0][i] = rec[0];
+        particles[1][i] = rec[1];
+        particles[2][i] = rec[2];
+        particles[3][i] = rec[3];
+        particles[4][i] = rec[4];
+        particles[5][i] = rec[5];  // cos(phi)
+        particles[6][i] = rec[6];  // sin(phi)
+        if (nfields >= 9)
+        {
+            particles[P_SPECIES][i] = rec[7];
+            particles[P_MASS][i] = rec[8];
+        }
+        else
+        {
+            particles[P_SPECIES][i] = 0.0;
+            particles[P_MASS][i] = default_mass;
+        }
     }
 
     fclose(fp);
-    log_message("INFO", "Read initial conditions (%d particles) from '%s'", npts, filename);
+
+    validate_initial_conditions(particles, npts, filename, nfields, default_mass);
+    if (nfields >= 9)
+        log_message("INFO", "Read initial conditions (%d particles, %d-field records with species and mass) from '%s'", npts, nfields, filename);
+    else
+        log_message("INFO", "Read initial conditions (%d particles, legacy 7-field records; species=0, mass=%g Msun) from '%s'", npts, default_mass, filename);
 }
 
 /**
- * @brief Initializes per-particle masses in particles[8].
- * @details Sets each particle's mass to a uniform value of
- *          g_active_halo_mass / npts. This is the default equal-mass
- *          configuration. Override specific entries afterward for
- *          variable-mass distributions.
+ * @brief Writes the per-particle species and mass table, indexed by original particle ID.
+ * @details Species and mass do not change during a run, so they are written once per run to
+ *          `data/particle_species_mass<suffix>.dat` rather than with every snapshot. Snapshot
+ *          files (all_particle_data, ...) are indexed by the same particle ID.
+ *          Format: int32 npts, then int32 species[npts], then float64 mass[npts] (Msun).
  *
- *          Must be called after tidal stripping (so npts is final)
- *          and before the prefix-sum build and main time loop.
- *
- * @param particles [in/out] Particle data array. Writes to particles[8].
- * @param npts      [in]     Final number of particles after stripping.
+ * @param filename   [in] Output path.
+ * @param species_by_id [in] Species per particle ID.
+ * @param mass_by_id [in] Mass per particle ID (Msun).
+ * @param npts       [in] Number of particles.
  */
-static void initialize_particle_masses(double** particles, int npts)
+static void write_species_mass_file(const char *filename, const int *species_by_id, const double *mass_by_id, int npts)
 {
-    int profile = 1; // temporary hard-coding. To be replaced by user-selected profiles. @@TBD@@
-
-    if (profile == 0) // Equal mass per particle
+    FILE *fp = fopen(filename, "wb");
+    if (!fp)
     {
-        double m = g_active_halo_mass / (double)npts;
-        for (int i = 0; i < npts; i++)
-            particles[8][i] = m;
+        fprintf(stderr, "Error: cannot open '%s' for writing particle species/mass.\n", filename);
+        return;
     }
-    if (profile == 1) // Baryons of mass 1000 times greater than DM
-    {
-        int n_dm = 0;
-        double m_dm;
-        double m_bar;
-        double mass_ratio = 100000; //ratio of masses m_bar/m_dm
-        for (int i = 0; i < npts; i++)
-            n_dm += particles[7][i];
-        m_dm = g_active_halo_mass / (npts + (mass_ratio-1) * n_dm);
-        m_bar = mass_ratio * m_dm;
+    fwrite(&npts, sizeof(int), 1, fp);
+    fwrite(species_by_id, sizeof(int), (size_t)npts, fp);
+    fwrite(mass_by_id, sizeof(double), (size_t)npts, fp);
+    fclose(fp);
+    log_message("INFO", "Wrote particle species/mass table (%d particles) to '%s'", npts, filename);
+}
 
-        for (int i = 0; i < npts; i++) {
-            if(particles[7][i]==1)
-                particles[8][i] = m_bar;
-            else
-                particles[8][i] = m_dm;
-        }
+/**
+ * @brief Reads the per-particle species and mass table written by write_species_mass_file.
+ *
+ * @param filename      [in]  Input path.
+ * @param npts          [in]  Expected number of particles.
+ * @param species_by_id [out] Species per particle ID.
+ * @param mass_by_id    [out] Mass per particle ID (Msun).
+ * @return int 1 on success, 0 if the file is missing or does not match `npts`.
+ */
+static int read_species_mass_file(const char *filename, int npts, int *species_by_id, double *mass_by_id)
+{
+    FILE *fp = fopen(filename, "rb");
+    if (!fp)
+        return 0;
+    int file_npts = 0;
+    int ok = (fread(&file_npts, sizeof(int), 1, fp) == 1) && (file_npts == npts) &&
+             (fread(species_by_id, sizeof(int), (size_t)npts, fp) == (size_t)npts) &&
+             (fread(mass_by_id, sizeof(double), (size_t)npts, fp) == (size_t)npts);
+    fclose(fp);
+    return ok;
+}
+
+/**
+ * @brief Fills species/mass per particle ID from the table file, or with defaults if it is absent.
+ * @details Used when particle state is reloaded from snapshot files (restart, extend,
+ *          post-processing), which do not carry species or mass. Falls back to species 0 and
+ *          `default_mass` (with a warning) for runs that predate the table.
+ *
+ * @param filename      [in]  Path of data/particle_species_mass<suffix>.dat.
+ * @param npts          [in]  Number of particles.
+ * @param default_mass  [in]  Fallback particle mass (Msun).
+ * @param species_by_id [out] Species per particle ID.
+ * @param mass_by_id    [out] Mass per particle ID (Msun).
+ */
+static void load_species_mass_or_default(const char *filename, int npts, double default_mass,
+                                         int *species_by_id, double *mass_by_id)
+{
+    if (read_species_mass_file(filename, npts, species_by_id, mass_by_id))
+    {
+        printf("  - Loaded particle species/mass from: %s\n", filename);
+        return;
+    }
+    printf("  - WARNING: no valid species/mass table '%s'; assuming species 0 and mass %g Msun\n",
+           filename, default_mass);
+    log_message("WARNING", "No species/mass table '%s'; using species 0, mass %g Msun", filename, default_mass);
+    for (int i = 0; i < npts; i++)
+    {
+        species_by_id[i] = 0;
+        mass_by_id[i] = default_mass;
     }
 }
+
 // =============================================================================
 // SORTING ALGORITHM CONFIGURATION
 // =============================================================================
@@ -5527,13 +8680,13 @@ static int check_strict_monotonicity(const double *arr, int n, const char *name)
  * @param dt                [in] The simulation timestep (Myr).
  * @param current_sim_time  [in] The current simulation time at the beginning of this step (Myr).
  * @param active_profile_rc [in] The scale radius (kpc) of the currently active profile (NFW, Cored, or Hernquist),
- *                              passed to `sigmatotal`.
+ *                              passed to the scattering routines.
  * @param current_method_display_num [in] The user-facing display number of the current integration method (for logging).
  * @param bootstrap_phase_active [in] Flag (0 or 1) indicating if a bootstrap phase (e.g., for Adams-Bashforth)
  *                               is active. If 1, SIDM scattering is skipped for this step.
  * @note This function modifies the `particles` array in-place.
  * @note It uses global variables: `g_enable_sidm_scattering`, `g_sidm_execution_mode`,
- *       `g_sidm_seed`, `g_total_sidm_scatters`, `g_active_halo_mass`, `g_doDebug`,
+ *       `g_sidm_seed`, `g_total_sidm_scatters`, `g_doDebug`,
  *       and `g_particle_scatter_state`.
  */
 static void handle_sidm_step(double **particles, int npts, double dt, double current_sim_time,
@@ -5553,16 +8706,16 @@ static void handle_sidm_step(double **particles, int npts, double dt, double cur
             // Deterministic parallel SIDM (no RNG state needed)
             perform_sidm_scattering_parallel_graphcolor(particles, npts, dt, timestep_idx,
                                            g_sidm_seed, &Nscatters_in_this_step,
-                                           g_active_halo_mass, active_profile_rc, current_scatter_counts);
+                                           active_profile_rc, current_scatter_counts);
         #else
             // Serial fallback if OpenMP not compiled but parallel mode selected
             log_message("WARNING", "SIDM Parallel mode selected but OpenMP not enabled. Running SIDM serially.");
             perform_sidm_scattering_serial(particles, npts, dt, timestep_idx, g_sidm_seed,
-                                         &Nscatters_in_this_step, g_active_halo_mass, active_profile_rc, current_scatter_counts);
+                                         &Nscatters_in_this_step, active_profile_rc, current_scatter_counts);
         #endif
     } else { // Serial SIDM execution
         perform_sidm_scattering_serial(particles, npts, dt, timestep_idx, g_sidm_seed,
-                                     &Nscatters_in_this_step, g_active_halo_mass, active_profile_rc, current_scatter_counts);
+                                     &Nscatters_in_this_step, active_profile_rc, current_scatter_counts);
     }
     
     g_total_sidm_scatters += Nscatters_in_this_step;
@@ -6707,7 +9860,7 @@ int main(int argc, char *argv[])
 {
 // Print the tool header first, regardless of OpenMP status
 printf("\n===================================================================================================\n");
-printf("NSphere Simulation Tool - Including changes by Eylon\n");
+printf("NSphere Simulation Tool\n");
 printf("===================================================================================================\n");
 printf("  \n");
 
@@ -6799,7 +9952,9 @@ printf("  \n");
     if (detected_hybrid && p_cores > 0) {
         g_hybrid_p_cores = p_cores;
 
-        if (g_sidm_execution_mode == 1) {
+        // An explicit OMP_NUM_THREADS wins (e.g. one thread per run in concurrent campaigns); this runs before the
+        // arguments are parsed, so --sidm-mode cannot be used to skip it.
+        if (g_sidm_execution_mode == 1 && getenv("OMP_NUM_THREADS") == NULL) {
             max_threads = p_cores;
             printf("Hybrid CPU detected: Using %d P-cores for SIDM, %d total cores available\n",
                    p_cores, g_default_max_threads);
@@ -7207,6 +10362,178 @@ printf("  \n");
                 errorAndExit(buf, NULL, argv[0]);
             }
         }
+        else if (strcmp(argv[i], "--menc-field") == 0)
+        {
+            /** @note Enable the M(r) enclosed-mass field (method 1 only; validated after parsing). */
+            g_menc_field = 1;
+        }
+        else if (strcmp(argv[i], "--drag") == 0)
+        {
+            /** @note Enable Chandrasekhar dynamical friction on stars (method 1 only; validated after parsing). */
+            g_enable_drag_force = 1;
+        }
+        else if (strcmp(argv[i], "--drag-softening") == 0)
+        {
+            /** @note Star-DM softening length eps in pc for --drag's Coulomb logarithm (0 = off); see drag_force. */
+            if (i + 1 >= argc)
+            {
+                errorAndExit("--drag-softening requires a length in pc", NULL, argv[0]);
+            }
+            char *end = NULL;
+            g_drag_softening_pc = strtod(argv[++i], &end);
+            if (end == argv[i] || *end != '\0' || !(g_drag_softening_pc >= 0.0))
+            {
+                errorAndExit("--drag-softening must be a number of pc >= 0", NULL, argv[0]);
+            }
+            g_drag_softening_provided = 1;
+        }
+        else if (strcmp(argv[i], "--drag-random-deposit") == 0)
+        {
+            /** @note With --drag: heat the dark matter with random-direction kicks instead of velocity scaling. */
+            g_drag_random_deposit = 1;
+        }
+        else if (strcmp(argv[i], "--star-dm-rutherford") == 0)
+        {
+            /** @note Star-DM gravitational (Rutherford) scattering instead of --drag (method 1 only; validated after parsing). */
+            g_star_dm_rutherford = 1;
+        }
+        else if (strcmp(argv[i], "--star-dm-neighbours") == 0)
+        {
+            /** @note Dark-matter rank neighbours per star for --star-dm-rutherford. */
+            if (i + 1 >= argc || !isInteger(argv[i + 1]))
+            {
+                errorAndExit("--star-dm-neighbours requires an integer number of neighbours", NULL, argv[0]);
+            }
+            g_star_dm_neighbours = atoi(argv[++i]);
+            if (g_star_dm_neighbours < 2)
+            {
+                errorAndExit("--star-dm-neighbours must be >= 2", NULL, argv[0]);
+            }
+            g_star_dm_neighbours_provided = 1;
+        }
+        else if (strcmp(argv[i], "--star-star-rutherford") == 0)
+        {
+            /** @note Star-star gravitational (Rutherford) scattering among species 1-9 (method 1 only; validated after parsing). */
+            g_star_star_rutherford = 1;
+        }
+        else if (strcmp(argv[i], "--star-star-neighbours") == 0)
+        {
+            /** @note Star rank neighbours on each side of a star for --star-star-rutherford. */
+            if (i + 1 >= argc || !isInteger(argv[i + 1]))
+            {
+                errorAndExit("--star-star-neighbours requires an integer number of neighbours", NULL, argv[0]);
+            }
+            g_star_star_neighbours = atoi(argv[++i]);
+            if (g_star_star_neighbours < 1)
+            {
+                errorAndExit("--star-star-neighbours must be >= 1", NULL, argv[0]);
+            }
+            g_star_star_neighbours_provided = 1;
+        }
+        else if (strcmp(argv[i], "--star-star-seed") == 0)
+        {
+            if (i + 1 >= argc || !isInteger(argv[i + 1]))
+            {
+                errorAndExit("--star-star-seed requires an integer argument", NULL, argv[0]);
+            }
+            g_star_star_seed = strtoul(argv[++i], NULL, 10);
+            g_star_star_seed_provided = 1;
+        }
+        else if (strcmp(argv[i], "--drag-no-radial") == 0)
+        {
+            /** @note With --drag: damp only the angular momentum, leave v_r undamped. */
+            g_drag_no_radial = 1;
+        }
+        else if (strcmp(argv[i], "--menc-smooth") == 0)
+        {
+            /** @note Smooth shared M(r) table with knots every K particles (method 1 only). */
+            if (i + 1 >= argc || !isInteger(argv[i + 1]))
+            {
+                errorAndExit("--menc-smooth requires an integer knot spacing K", NULL, argv[0]);
+            }
+            g_menc_smooth_k = atoi(argv[++i]);
+            if (g_menc_smooth_k < 2)
+            {
+                errorAndExit("--menc-smooth K must be >= 2", NULL, argv[0]);
+            }
+        }
+        else if (strcmp(argv[i], "--star-substeps") == 0)
+        {
+            /** @note Stars first in M sub-steps; dark matter sees their interpolated shells (method 1, --menc-smooth). */
+            if (i + 1 >= argc || !isInteger(argv[i + 1]))
+            {
+                errorAndExit("--star-substeps requires an integer number of sub-steps M", NULL, argv[0]);
+            }
+            g_star_substeps = atoi(argv[++i]);
+            if (g_star_substeps < 0)
+            {
+                errorAndExit("--star-substeps M must be >= 0 (0 = off)", NULL, argv[0]);
+            }
+        }
+        else if (strcmp(argv[i], "--star-substep-method") == 0)
+        {
+            /** @note Star sub-step scheme: 1 = frozen partners; 2 = plus joint re-integration of overlapping clusters in
+             *        physical time; 3 = as 2 with clusters that have a Levi-Civita member in a shared Levi-Civita time
+             *        (see g_star_substep_method). */
+            if (i + 1 >= argc || !isInteger(argv[i + 1]))
+            {
+                errorAndExit("--star-substep-method requires 1, 2 or 3", NULL, argv[0]);
+            }
+            g_star_substep_method = atoi(argv[++i]);
+            if (g_star_substep_method < 1 || g_star_substep_method > 3)
+            {
+                errorAndExit("--star-substep-method must be 1, 2 or 3", NULL, argv[0]);
+            }
+        }
+        else if (strcmp(argv[i], "--star-dm-softening") == 0)
+        {
+            /** @note Star-DM softening length eps in pc for --star-dm-rutherford (0 = off); see rutherford_sigma_T. */
+            if (i + 1 >= argc)
+            {
+                errorAndExit("--star-dm-softening requires a length in pc", NULL, argv[0]);
+            }
+            char *end = NULL;
+            g_star_dm_softening_pc = strtod(argv[++i], &end);
+            if (end == argv[i] || *end != '\0' || !(g_star_dm_softening_pc >= 0.0))
+            {
+                errorAndExit("--star-dm-softening must be a number of pc >= 0", NULL, argv[0]);
+            }
+            g_star_dm_softening_provided = 1;
+        }
+        else if (strcmp(argv[i], "--star-dm-bmax-floor") == 0)
+        {
+            /** @note Lower bound in pc on --star-dm-rutherford's b_max (0 = off); see perform_star_dm_rutherford. */
+            if (i + 1 >= argc)
+            {
+                errorAndExit("--star-dm-bmax-floor requires a length in pc", NULL, argv[0]);
+            }
+            char *end = NULL;
+            g_star_dm_bmax_floor_pc = strtod(argv[++i], &end);
+            if (end == argv[i] || *end != '\0' || !(g_star_dm_bmax_floor_pc >= 0.0))
+            {
+                errorAndExit("--star-dm-bmax-floor must be a number of pc >= 0", NULL, argv[0]);
+            }
+            g_star_dm_bmax_floor_provided = 1;
+        }
+        else if (strcmp(argv[i], "--star-softening") == 0)
+        {
+            /** @note Star-star softening length eps in pc (0 = off); see star_pair_smax. */
+            if (i + 1 >= argc)
+            {
+                errorAndExit("--star-softening requires a length in pc", NULL, argv[0]);
+            }
+            char *end = NULL;
+            g_star_softening_pc = strtod(argv[++i], &end);
+            if (end == argv[i] || *end != '\0' || !(g_star_softening_pc >= 0.0))
+            {
+                errorAndExit("--star-softening must be a number of pc >= 0", NULL, argv[0]);
+            }
+        }
+        else if (strcmp(argv[i], "--menc-interp") == 0)
+        {
+            /** @note Linear interpolation of the M(r) field between radii (requires --menc-field). */
+            g_menc_interp = 1;
+        }
         else if (strcmp(argv[i], "--methodtag") == 0)
         {
             /** @note Flag to include integration method string in output filename suffix. */
@@ -7393,6 +10720,101 @@ printf("  \n");
     char *method_verbose_name;
 
     // Post-parsing validation for interdependent arguments
+    if (g_menc_field && display_method != 1) {
+        errorAndExit("--menc-field is only supported with '--method 1'", NULL, argv[0]);
+    }
+    if (g_enable_drag_force && display_method != 1) {
+        errorAndExit("--drag is only supported with '--method 1'", NULL, argv[0]);
+    }
+    if (g_drag_random_deposit && !g_enable_drag_force) {
+        errorAndExit("--drag-random-deposit requires --drag", NULL, argv[0]);
+    }
+    if (g_drag_random_deposit) {
+        printf("Drag energy deposited into the dark matter as random-direction kicks (--drag-random-deposit).\n");
+    }
+    if (g_drag_no_radial && !g_enable_drag_force) {
+        errorAndExit("--drag-no-radial requires --drag", NULL, argv[0]);
+    }
+    if (g_drag_softening_provided && !g_enable_drag_force) {
+        errorAndExit("--drag-softening requires --drag", NULL, argv[0]);
+    }
+    if (g_enable_drag_force) {
+        printf("Chandrasekhar dynamical friction (drag) on stars enabled%s.\n",
+               g_drag_no_radial ? " (angular momentum only, --drag-no-radial)" : "");
+        log_message("INFO", "Chandrasekhar dynamical friction enabled (--drag)");
+        if (g_drag_softening_pc > 0.0) {
+            printf("Drag Coulomb logarithm softened: star-DM spline softening eps = %g pc (support %g pc) (--drag-softening).\n",
+                   g_drag_softening_pc, STAR_SOFT_KERNEL * g_drag_softening_pc);
+            log_message("INFO", "Drag ln Lambda softened (--drag-softening %g pc)", g_drag_softening_pc);
+            build_soft_sigma_table(); // before the parallel integration reads it
+        }
+    }
+    if (g_star_dm_rutherford && display_method != 1) {
+        errorAndExit("--star-dm-rutherford is only supported with '--method 1'", NULL, argv[0]);
+    }
+    if (g_star_dm_rutherford && g_enable_drag_force) {
+        errorAndExit("--star-dm-rutherford and --drag cannot be used together", NULL, argv[0]);
+    }
+    if (g_star_dm_neighbours_provided && !g_star_dm_rutherford) {
+        errorAndExit("--star-dm-neighbours requires --star-dm-rutherford", NULL, argv[0]);
+    }
+    if (g_star_dm_softening_provided && !g_star_dm_rutherford) {
+        errorAndExit("--star-dm-softening requires --star-dm-rutherford", NULL, argv[0]);
+    }
+    if (g_star_dm_bmax_floor_provided && !g_star_dm_rutherford) {
+        errorAndExit("--star-dm-bmax-floor requires --star-dm-rutherford", NULL, argv[0]);
+    }
+    if (g_star_dm_rutherford) {
+        printf("Star-DM Rutherford scattering enabled (%d dark-matter rank neighbours per star, softening eps = %g pc, b_max floor = %g pc).\n",
+               g_star_dm_neighbours, g_star_dm_softening_pc, g_star_dm_bmax_floor_pc);
+        log_message("INFO", "Star-DM Rutherford scattering enabled (--star-dm-rutherford, --star-dm-softening %g pc, --star-dm-bmax-floor %g pc)",
+                    g_star_dm_softening_pc, g_star_dm_bmax_floor_pc);
+    }
+    if (g_star_star_rutherford && display_method != 1) {
+        errorAndExit("--star-star-rutherford is only supported with '--method 1'", NULL, argv[0]);
+    }
+    if (g_star_star_neighbours_provided && !g_star_star_rutherford) {
+        errorAndExit("--star-star-neighbours requires --star-star-rutherford", NULL, argv[0]);
+    }
+    if (g_star_star_seed_provided && !g_star_star_rutherford) {
+        errorAndExit("--star-star-seed requires --star-star-rutherford", NULL, argv[0]);
+    }
+    if (g_star_star_rutherford) {
+        printf("Star-star Rutherford scattering enabled (species 1-%d, %d star rank neighbours on each side, softening eps = %g pc).\n",
+               STAR_MAX_SPECIES, g_star_star_neighbours, g_star_softening_pc);
+        log_message("INFO", "Star-star Rutherford scattering enabled (--star-star-rutherford, k = %d, --star-softening %g pc)",
+                    g_star_star_neighbours, g_star_softening_pc);
+    }
+    if ((g_star_dm_rutherford && g_star_dm_softening_pc > 0.0) || (g_star_star_rutherford && g_star_softening_pc > 0.0))
+        build_soft_sigma_table(); // softened cross-section table (~0.3 s), outside the timed collision passes
+    if (g_menc_smooth_k > 0 && display_method != 1) {
+        errorAndExit("--menc-smooth is only supported with '--method 1'", NULL, argv[0]);
+    }
+    if (g_menc_smooth_k > 0 && g_menc_field) {
+        errorAndExit("--menc-smooth and --menc-field cannot be used together", NULL, argv[0]);
+    }
+    if (g_menc_smooth_k > 0) {
+        printf("Smooth enclosed-mass table M(r) enabled (PCHIP, knots every %d particles).\n", g_menc_smooth_k);
+        log_message("INFO", "Smooth M(r) table enabled (--menc-smooth %d)", g_menc_smooth_k);
+    }
+    if (g_star_substeps > 0 && display_method != 1) {
+        errorAndExit("--star-substeps is only supported with '--method 1'", NULL, argv[0]);
+    }
+    if (g_star_substeps > 0 && g_menc_smooth_k <= 0) {
+        errorAndExit("--star-substeps requires --menc-smooth (the dark matter is the smooth table)", NULL, argv[0]);
+    }
+    if (g_star_substeps > 0) {
+        printf("Stars integrated in %d sub-steps per step; dark matter sees their softened shells (--star-substeps).\n", g_star_substeps);
+        log_message("INFO", "Discrete star shells with %d sub-steps (--star-substeps)", g_star_substeps);
+    }
+    if (g_menc_interp && !g_menc_field) {
+        errorAndExit("--menc-interp requires --menc-field", NULL, argv[0]);
+    }
+    if (g_menc_field) {
+        printf("Enclosed-mass field M(r) enabled (%s).\n",
+               g_menc_interp ? "linear interpolation between radii" : "step function at each particle radius");
+        log_message("INFO", "M(r) enclosed-mass field enabled (--menc-field%s)", g_menc_interp ? " --menc-interp" : "");
+    }
     if (g_anisotropy_beta_provided && strcmp(g_profile_type_str, "hernquist") != 0) {
         char err_msg[256];
         snprintf(err_msg, sizeof(err_msg), 
@@ -7568,7 +10990,7 @@ printf("  \n");
         g_cored_profile_rmax_factor = g_cutoff_factor_param;
     }
 
-    // Set the single g_active_halo_mass for N-body forces and tdyn from the finalized g_halo_mass_param
+    // Set g_active_halo_mass (used to assign initial particle masses) from the finalized g_halo_mass_param
     g_active_halo_mass = g_halo_mass_param;
     
     // Validate --sim-extend requirements
@@ -7714,7 +11136,7 @@ printf("  \n");
     }
     
     // This g_active_halo_mass is now correctly set from g_halo_mass_param which reflects the chosen profile's mass
-    printf("  N-body Active Halo Mass (tdyn): %.3e Msun\n", g_active_halo_mass);
+    printf("  Halo Mass for particle masses: %.3e Msun (each generated particle: halo mass / npts)\n", g_active_halo_mass);
     
     /** @note Display logging status based on g_enable_logging flag. */
     if (g_enable_logging)
@@ -7827,7 +11249,7 @@ printf("  \n");
             }
             
             if (src_N == npts) {
-                if ((source_size / N_BYTES_PER_RECORD) % npts == 0) {
+                if ((source_size / 16) % npts == 0) {
                     strncpy(restart_source_file, g_extend_file_source, sizeof(restart_source_file) - 1);
                     restart_source_file[sizeof(restart_source_file) - 1] = '\0';
 
@@ -7871,8 +11293,8 @@ printf("  \n");
             fclose(check);
             
             // Calculate completion
-            long long expected_complete_size = (long long)total_writes * (long long)npts * (long long)N_BYTES_PER_RECORD;
-            long long completed_records = actual_size / N_BYTES_PER_RECORD;
+            long long expected_complete_size = (long long)total_writes * (long long)npts * 16LL;
+            long long completed_records = actual_size / 16;
             long long completed_snapshots = completed_records / npts;
             
             if (actual_size > 0 && actual_size < expected_complete_size) {
@@ -8088,7 +11510,7 @@ printf("  \n");
     double result, error;               ///< GSL integration results
     double calE;                        ///< Energy value for calculations
     gsl_integration_workspace *w = NULL; ///< GSL integration workspace
-
+    
     // Common spline objects and accelerators
     gsl_spline *splinemass = NULL;      ///< Spline for mass profile M(r)
     gsl_interp_accel *enclosedmass = NULL; ///< Accelerator for mass spline
@@ -8123,12 +11545,12 @@ printf("  \n");
      * @brief Allocate main particle data array before profile selection.
      * @details This ensures both NFW and Cored pathways use the same particles array.
      */
-    particles = (double **)malloc(N_PARTICLE_PARAMS * sizeof(double *));  // Rows 5,6 for cos(phi), sin(phi). Rows 7,8,9 for species, mass (unused) and reserved (unused) respectively.
+    particles = (double **)malloc(N_PARTICLE_FIELDS * sizeof(double *));  // Rows 5,6: cos/sin(phi); 7: species; 8: mass
     if (particles == NULL) {
         fprintf(stderr, "ERROR: Memory allocation failed for particle array pointer\n");
         CLEAN_EXIT(1);
     }
-    for (i = 0; i < N_PARTICLE_PARAMS; i++) {  // N_PARTICLE_PARAMS rows for extended particle state
+    for (i = 0; i < N_PARTICLE_FIELDS; i++) {  // All rows of the particle state
         particles[i] = (double *)malloc(npts_initial * sizeof(double));
         if (particles[i] == NULL) {
             fprintf(stderr, "ERROR: Memory allocation failed for particles[%d]\n", i);
@@ -8222,7 +11644,34 @@ printf("  \n");
     } else {
         log_message("INFO", "Using user-provided SIDM seed: %lu", g_sidm_seed);
     }
-    
+
+    // Determine the star-star seed (--star-star-rutherford), same rules as the SIDM seed
+    if (!g_star_star_seed_provided) {
+        if (g_master_seed_provided) {
+            g_star_star_seed = g_master_seed + 3; // Deterministic offset, different from IC and SIDM seeds
+        } else if (g_attempt_load_seeds) {
+            get_suffixed_filename(g_star_star_seed_filename_base, 1, seed_filepath, sizeof(seed_filepath));
+            fp_seed = fopen(seed_filepath, "r");
+            if (fp_seed) {
+                if (fscanf(fp_seed, "%lu", &g_star_star_seed) == 1) {
+                    log_message("INFO", "Loaded star-star seed %lu from %s", g_star_star_seed, seed_filepath);
+                } else {
+                    g_star_star_seed = current_time_pid_seed + 300; // Fallback
+                    log_message("WARNING", "Failed to read star-star seed from %s, generating new: %lu", seed_filepath, g_star_star_seed);
+                }
+                fclose(fp_seed);
+            } else {
+                g_star_star_seed = current_time_pid_seed + 300; // File not found, generate
+                log_message("INFO", "No star-star seed file found, generating new: %lu", g_star_star_seed);
+            }
+        } else {
+            g_star_star_seed = current_time_pid_seed + 300; // Default generation
+            log_message("INFO", "Generating new star-star seed: %lu", g_star_star_seed);
+        }
+    } else {
+        log_message("INFO", "Using user-provided star-star seed: %lu", g_star_star_seed);
+    }
+
     // Save the seeds that will actually be used
     // Save Initial Conditions Seed
     get_suffixed_filename(g_initial_cond_seed_filename_base, 1, seed_filepath, sizeof(seed_filepath));
@@ -8241,6 +11690,18 @@ printf("  \n");
         fclose(fp_seed);
         log_message("INFO", "Saved SIDM seed %lu to %s", g_sidm_seed, seed_filepath);
     }
+
+    // Save the star-star seed (only when it is used)
+    if (g_star_star_rutherford) {
+        get_suffixed_filename(g_star_star_seed_filename_base, 1, seed_filepath, sizeof(seed_filepath));
+        fp_seed = fopen(seed_filepath, "w");
+        if (fp_seed) {
+            fprintf(fp_seed, "%lu\n", g_star_star_seed);
+            fclose(fp_seed);
+            log_message("INFO", "Saved star-star seed %lu to %s", g_star_star_seed, seed_filepath);
+        }
+        printf("Star-star seed: %lu\n", g_star_star_seed);
+    }
     
     // Seed the global g_rng (used for ICs and Serial SIDM)
     gsl_rng_set(g_rng, g_initial_cond_seed);       // Use the determined IC seed for g_rng
@@ -8249,12 +11710,18 @@ printf("  \n");
     // Initialize persistent cos(phi) and sin(phi) orientation angles for SIDM scattering.
     // Azimuthal angles represent perpendicular velocity direction in spherical coordinates.
     // Random initialization in [0, 2π]; updated during SIDM scattering events.
+    // Species and mass: generated ICs are a single equal-mass dark-matter population. The mass is
+    // halo_mass / npts with npts the count retained after tidal stripping, so the retained system
+    // has total mass halo_mass.
     if (!doReadInit && !g_restart_mode_active) {
         log_message("INFO", "Initializing persistent cos/sin(phi) angles for %d particles.", npts_initial);
+        double m_particle = g_active_halo_mass / (double)npts;
         for (i = 0; i < npts_initial; i++) {
             double phi_val = 2.0 * PI * gsl_rng_uniform(g_rng);
             particles[5][i] = cos(phi_val);
             particles[6][i] = sin(phi_val);
+            particles[P_SPECIES][i] = 0.0;
+            particles[P_MASS][i] = m_particle;
         }
     }
 
@@ -9251,7 +12718,7 @@ cleanup_diag_iteration:
         if (doReadInit) {
             // Read initial conditions from file
             printf("Reading initial conditions from %s...\n", readInitFilename);
-            read_initial_conditions(particles, npts_initial, readInitFilename);
+            read_initial_conditions(particles, npts_initial, readInitFilename, g_active_halo_mass / (double)npts);
         } else if (!g_doRestart) {
             if (tidal_fraction > 0.0) {
                 log_message("INFO", "NFW IC Gen: Initial particle count before stripping: %d", npts_initial);
@@ -9389,7 +12856,7 @@ cleanup_diag_iteration:
                 long file_size = ftell(check_file);
                 fclose(check_file);
 
-                int total_snapshots = file_size / (npts * N_BYTES_PER_RECORD);
+                int total_snapshots = file_size / (npts * 16);
                 int snapshot_index = total_snapshots - 1;  // Last snapshot (0-based index)
 
                 printf("Restart file has %d snapshots, loading last snapshot (index %d)\n",
@@ -9527,19 +12994,6 @@ cleanup_diag_iteration:
                 }
     
                 particles[3][k_nfw] = (double)k_nfw; // Particle ID
-
-                double bar_dm_ratio = 0.2;
-                double random_chance = (double)rand() / (double)RAND_MAX;
-                if (random_chance < bar_dm_ratio) // Random assignment of species @TEST@
-                    particles[7][k_nfw] = 1;
-                else
-                    particles[7][k_nfw] = 0;
-            }
-            for (int k_nfw = 0; k_nfw < npts_initial; k_nfw++) { // Scale all radius of baryons by scale @TEST@
-                double radial_scaling = 1;
-                if (particles[7][k_nfw] == 1) {
-                    particles[0][k_nfw] = particles[0][k_nfw] * radial_scaling;
-                }
             }
             } // End of else block (normal generation vs restart)
             
@@ -9580,7 +13034,7 @@ cleanup_diag_iteration:
             long file_size = ftell(check_file);
             fclose(check_file);
 
-            int total_snapshots = file_size / (npts * N_BYTES_PER_RECORD);
+            int total_snapshots = file_size / (npts * 16);
             int snapshot_index = total_snapshots - 1;  // Last snapshot (0-based index)
 
             printf("Restart file has %d snapshots, loading last snapshot (index %d)\n",
@@ -9603,7 +13057,7 @@ cleanup_diag_iteration:
             );
         } else if (doReadInit) {
             printf("Reading initial conditions from %s...\n", readInitFilename);
-            read_initial_conditions(particles, npts_initial, readInitFilename);
+            read_initial_conditions(particles, npts_initial, readInitFilename, g_active_halo_mass / (double)npts);
         } else if (!g_doRestart) {
             // Generate particles using newly constructed splines
             generate_ics_hernquist_anisotropic(particles, npts_initial, g_rng, g_halo_mass_param, g_scale_radius_param,
@@ -9961,7 +13415,7 @@ cleanup_diag_iteration:
             long file_size = ftell(check_file);
             fclose(check_file);
 
-            int total_snapshots = file_size / (npts * N_BYTES_PER_RECORD);
+            int total_snapshots = file_size / (npts * 16);
             int snapshot_index = total_snapshots - 1;  // Last snapshot (0-based index)
 
             printf("Restart file has %d snapshots, loading last snapshot (index %d)\n",
@@ -9984,7 +13438,7 @@ cleanup_diag_iteration:
             );
         } else if (doReadInit) {
             printf("Reading initial conditions from %s...\n", readInitFilename);
-            read_initial_conditions(particles, npts_initial, readInitFilename);
+            read_initial_conditions(particles, npts_initial, readInitFilename, g_active_halo_mass / (double)npts);
         } else if (!g_doRestart) {
             log_message("INFO", "Hernquist: Starting particle generation for %d particles", npts_initial);
             
@@ -10927,7 +14381,7 @@ cleanup_diag_iteration:
     {
         /** @brief Load existing initial conditions from specified file. */
         printf("Reading initial conditions from %s...\n", readInitFilename);
-        read_initial_conditions(particles, npts_initial, readInitFilename);
+        read_initial_conditions(particles, npts_initial, readInitFilename, g_active_halo_mass / (double)npts);
     }
     else if (!g_doRestart) // Only generate if NOT reading init file and NOT restarting
     {
@@ -10950,7 +14404,7 @@ cleanup_diag_iteration:
             long file_size = ftell(check_file);
             fclose(check_file);
 
-            int total_snapshots = file_size / (npts * N_BYTES_PER_RECORD);
+            int total_snapshots = file_size / (npts * 16);
             int snapshot_index = total_snapshots - 1;  // Last snapshot (0-based index)
 
             printf("Restart file has %d snapshots, loading last snapshot (index %d)\n",
@@ -11135,7 +14589,7 @@ cleanup_diag_iteration:
         sort_particles_with_alg(particles, npts_initial, "quadsort"); // Sorts by particles[0]
 
         /** @note Allocate new smaller arrays (`final_particles`) for the `npts` particles to keep. */
-        double **final_particles = (double **)malloc(N_PARTICLE_PARAMS * sizeof(double *));  // N_PARTICLE_PARAMS rows for extended state
+        double **final_particles = (double **)malloc(N_PARTICLE_FIELDS * sizeof(double *));  // All rows of the particle state
         if (final_particles == NULL)
         {
             fprintf(stderr, "Memory allocation failed for final_particles\n");
@@ -11143,7 +14597,7 @@ cleanup_diag_iteration:
         }
 
         /** @brief Copy innermost `npts` particles to final arrays and replace `particles` pointers. */
-        for (int i = 0; i < N_PARTICLE_PARAMS; i++) // Loop over all N_PARTICLE_PARAMS particle components
+        for (int i = 0; i < N_PARTICLE_FIELDS; i++) // Loop over all particle components
         {
             final_particles[i] = (double *)malloc(npts * sizeof(double));
             if (final_particles[i] == NULL)
@@ -11173,18 +14627,6 @@ cleanup_diag_iteration:
          */
         reassign_orig_ids_with_rank(particles[3], npts);
     } // End tidal stripping block (!g_doRestart)
-
-
-    /**
-     * @brief Initialize per-particle masses for freshly generated ICs.
-     * @details Skipped when loading from file (doReadInit) or restarting,
-     *          since those paths populate particles[8] directly.
-     */
-    if (!doReadInit && !g_doRestart && !g_restart_mode_active)
-    {
-        initialize_particle_masses(particles, npts);
-    }
-
 
     /**
      * @brief VELOCITY UNIT CONVERSION and ORIENTATION block.
@@ -11246,9 +14688,43 @@ cleanup_diag_iteration:
     } // End skip_file_writes block for particles.dat
 
     /**
+     * @brief Per-particle species and mass by original ID, for post-processing and restarts.
+     * @details In `--restart` (post-processing only) mode no particles were generated, so the
+     *          table is read from data/particle_species_mass<suffix>.dat; otherwise it is built
+     *          from the particle array (after stripping and ID remapping) and written to that file.
+     */
+    g_particle_mass_by_id = (double *)malloc((size_t)npts * sizeof(double));
+    g_particle_species_by_id = (int *)malloc((size_t)npts * sizeof(int));
+    if (!g_particle_mass_by_id || !g_particle_species_by_id) {
+        fprintf(stderr, "Error: Failed to allocate per-particle species/mass tables\n");
+        CLEAN_EXIT(1);
+    }
+    {
+        char species_mass_filename[512];
+        get_suffixed_filename("data/particle_species_mass.dat", 1, species_mass_filename, sizeof(species_mass_filename));
+        if (g_doRestart) {
+            load_species_mass_or_default(species_mass_filename, npts, g_active_halo_mass / (double)npts,
+                                         g_particle_species_by_id, g_particle_mass_by_id);
+        } else {
+            for (int k = 0; k < npts; k++) {
+                int pid = (int)particles[3][k];
+                if (pid < 0 || pid >= npts) {
+                    fprintf(stderr, "Error: particle ID %d out of range [0, %d) while building the species/mass table\n", pid, npts);
+                    CLEAN_EXIT(1);
+                }
+                g_particle_species_by_id[pid] = (int)particles[P_SPECIES][k];
+                g_particle_mass_by_id[pid] = particles[P_MASS][k];
+            }
+            if (!skip_file_writes)
+                write_species_mass_file(species_mass_filename, g_particle_species_by_id, g_particle_mass_by_id, npts);
+        }
+    }
+
+    /**
      * @brief SIMULATION TIMESTEP CALCULATION block.
-     * @details Calculates the characteristic dynamical time (`tdyn`) based on core radius (`RC`)
-     *          and total mass (`HALO_MASS`). Uses this to determine the total simulation
+     * @details Calculates the characteristic dynamical time (`tdyn`) based on the profile scale
+     *          radius and the total particle mass (sum of the per-particle masses). Uses this to
+     *          determine the total simulation
      *          duration (`totaltime = tfinal_factor * tdyn`) and the individual timestep
      *          size (`dt = totaltime / Ntimes`) used in the integration loop.
      * @see tdyn
@@ -11263,7 +14739,10 @@ cleanup_diag_iteration:
     } else {
         characteristic_radius_for_tdyn = g_cored_profile_rc; // Set from g_scale_radius_param
     }
-    double tdyn = 1.0 / sqrt((VEL_CONV_SQ * G_CONST) * g_active_halo_mass / cube(characteristic_radius_for_tdyn));
+    double total_particle_mass = 0.0;
+    for (int k = 0; k < npts; k++)
+        total_particle_mass += g_particle_mass_by_id[k];
+    double tdyn = 1.0 / sqrt((VEL_CONV_SQ * G_CONST) * total_particle_mass / cube(characteristic_radius_for_tdyn));
     double totaltime = (double)tfinal_factor * tdyn; ///< Total simulation time (Myr)
     double dt = totaltime / ((double)(Ntimes - 1));  ///< Individual timestep size (Myr)
     printf("Dynamical time tdyn = %.4f Myr\n", tdyn);
@@ -11493,11 +14972,10 @@ cleanup_diag_iteration:
      * @brief SIMULATION DATA TRACKING SETUP block.
      * @details Allocates memory for tracking particle data during the simulation.
      *          Includes the `inverse_map` array (mapping final_rank_id to current array index after sorting),
-     *          calculates `deltaM` (mass per particle), and allocates block storage arrays
+     *          builds the per-particle species/mass tables, and allocates block storage arrays
      *          (`L_block`, `Rank_block`, `R_block`, `Vrad_block`) if `g_doAllParticleData` is enabled.
      *          These blocks store data for `snapshot_block_size` timesteps before being written to disk.
      * @see inverse_map
-     * @see deltaM
      * @see L_block
      * @see Rank_block
      * @see R_block
@@ -11524,8 +15002,6 @@ cleanup_diag_iteration:
     }
 
 
-    /** @brief Calculate mass per particle based on *initial* particle count before stripping. Used for \f$M(\text{rank})\f$. */
-    double deltaM = g_active_halo_mass / (double)npts_initial;
 
     // snapshot_block_size already declared earlier
 
@@ -11552,7 +15028,7 @@ cleanup_diag_iteration:
     if (g_doSimRestart)
     {
         // Calculate expected file size for a complete simulation
-        long long expected_complete_size = (long long)total_writes * (long long)npts * (long long)N_BYTES_PER_RECORD;
+        long long expected_complete_size = (long long)total_writes * (long long)npts * 16LL;
         
         // Check if the all_particle_data file exists
         FILE *check_file = fopen(apd_filename, "rb");
@@ -11564,7 +15040,7 @@ cleanup_diag_iteration:
             fclose(check_file);
             
             // Calculate completion status
-            long long completed_records = actual_size / N_BYTES_PER_RECORD;  // N_BYTES_PER_RECORD bytes per record
+            long long completed_records = actual_size / 16;  // 16 bytes per record
             long long completed_timesteps = completed_records / npts;
             
             if (actual_size >= expected_complete_size)
@@ -11804,7 +15280,7 @@ cleanup_diag_iteration:
                 long file_size = ftell(check_file);
                 fclose(check_file);
 
-                int total_snapshots_after_truncation = file_size / (npts * N_BYTES_PER_RECORD);
+                int total_snapshots_after_truncation = file_size / (npts * 16);
                 int snapshot_to_load = total_snapshots_after_truncation - 1;  // Last snapshot (0-based)
 
                 printf("Loading particles from truncated file: %d snapshots, loading snapshot %d\n",
@@ -11894,7 +15370,7 @@ cleanup_diag_iteration:
         fseek(source_file, 0, SEEK_SET);
         
         // Calculate source file stats
-        long long source_records = source_size / N_BYTES_PER_RECORD;
+        long long source_records = source_size / 16;
         long long source_snapshots = source_records / npts;
         
         // Validate that the file size is consistent with the particle count
@@ -11984,12 +15460,12 @@ cleanup_diag_iteration:
             // Use command-line dtwrite to detect corruption/truncation
             //       If dtwrite is wrong, the next validator will catch it
             int expected_writes_from_cmdline = ((src_Ntimes - 1) / dtwrite) + 1;
-            long long expected_size_from_cmdline = (long long)expected_writes_from_cmdline * (long long)src_N * (long long)N_BYTES_PER_RECORD;
+            long long expected_size_from_cmdline = (long long)expected_writes_from_cmdline * (long long)src_N * 16LL;
 
             if (source_size != expected_size_from_cmdline) {
                 // Check if mismatch is due to wrong dtwrite or actual corruption
                 int expected_writes_from_file = ((src_Ntimes - 1) / src_dtwrite) + 1;
-                long long expected_size_from_file = (long long)expected_writes_from_file * (long long)src_N * (long long)N_BYTES_PER_RECORD;
+                long long expected_size_from_file = (long long)expected_writes_from_file * (long long)src_N * 16LL;
 
                 if (source_size == expected_size_from_file && src_dtwrite != dtwrite) {
                     // File matches calculated dtwrite but does not match command-line value
@@ -12021,7 +15497,7 @@ cleanup_diag_iteration:
                             src_N, src_Ntimes);
                     fprintf(stderr, "       File has %lld snapshots, implying dtwrite=%d\n",
                             source_snapshots, src_dtwrite);
-                    fprintf(stderr, "       Expected (with --dtwrite %d): %lld bytes (%d writes × %d particles × N_BYTES_PER_RECORD)\n",
+                    fprintf(stderr, "       Expected (with --dtwrite %d): %lld bytes (%d writes × %d particles × 16)\n",
                             dtwrite, expected_size_from_cmdline, expected_writes_from_cmdline, src_N);
                     fprintf(stderr, "       Actual:   %ld bytes (%lld snapshots)\n",
                             source_size, source_snapshots);
@@ -12735,12 +16211,11 @@ cleanup_diag_iteration:
     phi_block = (float *)malloc((size_t)npts * snapshot_block_size * sizeof(float)); // Phi angle
     scatter_count_block = (int *)calloc((size_t)npts * snapshot_block_size, sizeof(int)); // Scatter counts (initialized to 0)
     ID_block = (int *)malloc((size_t)npts * snapshot_block_size * sizeof(int));     // Particle IDs
-    species_block = (int*)malloc((size_t)npts * snapshot_block_size * sizeof(int));   // Species of particle
     // Check allocation results
-    if (!L_block || !Rank_block || !R_block || !Vrad_block || !phi_block || !scatter_count_block || !ID_block || !species_block) {
+    if (!L_block || !Rank_block || !R_block || !Vrad_block || !phi_block || !scatter_count_block || !ID_block) {
         fprintf(stderr, "Error: Failed to allocate block storage arrays.\n");
-        free(L_block); free(Rank_block); free(R_block); free(Vrad_block); free(phi_block); free(scatter_count_block); free(ID_block); free(species_block); // Free any that were allocated
-        L_block = NULL; Rank_block = NULL; R_block = NULL; Vrad_block = NULL; phi_block = NULL; scatter_count_block = NULL; ID_block = NULL; species_block = NULL; // Prevent double free in cleanup
+        free(L_block); free(Rank_block); free(R_block); free(Vrad_block); free(phi_block); free(scatter_count_block); free(ID_block); // Free any that were allocated
+        L_block = NULL; Rank_block = NULL; R_block = NULL; Vrad_block = NULL; phi_block = NULL; scatter_count_block = NULL; ID_block = NULL; // Prevent double free in cleanup
         CLEAN_EXIT(1);
     }
 
@@ -12859,7 +16334,7 @@ cleanup_diag_iteration:
         }
         
         // Calculate and display expected file size
-        long long expected_size = (long long)total_writes * (long long)npts * (long long)N_BYTES_PER_RECORD; // N_BYTES_PER_RECORD bytes per particle record
+        long long expected_size = (long long)total_writes * (long long)npts * 16LL; // 16 bytes per particle record
         double size_gb = expected_size / (1024.0 * 1024.0 * 1024.0);
         double size_mb = expected_size / (1024.0 * 1024.0);
         double size_kb = expected_size / 1024.0;
@@ -13121,12 +16596,101 @@ cleanup_diag_iteration:
      */
 
     // Initialize pre-calculated force constant to avoid repeated divisions
-    g_precalc_force_const = -(VEL_CONV_SQ * G_CONST) * (g_active_halo_mass / (double)npts);
+    rebuild_mass_prefix_sum(particles, npts); // Enclosed mass per rank for the current ordering
 
-    // Initialize prefix sum of masses
-    g_mass_prefix_sum[0] = 0.0;
-    for (int i = 1; i < npts; i++)
-        g_mass_prefix_sum[i] = g_mass_prefix_sum[i - 1] + particles[8][i - 1];
+    // --star-substeps not given: on (STAR_SUBSTEPS_DEFAULT) when the run has stars and the option applies
+    if (g_star_substeps < 0)
+    {
+        int has_stars = 0;
+        for (int i = 0; i < npts && !has_stars; i++)
+            has_stars = particles[P_SPECIES][i] != 0;
+        g_star_substeps = (has_stars && display_method == 1 && g_menc_smooth_k > 0) ? STAR_SUBSTEPS_DEFAULT : 0;
+        if (g_star_substeps > 0)
+        {
+            printf("Stars integrated in %d sub-steps per step (default; --star-substeps 0 turns this off).\n", g_star_substeps);
+            log_message("INFO", "Discrete star shells with %d sub-steps (default --star-substeps)", g_star_substeps);
+        }
+    }
+    if (g_star_substeps > 0 && g_star_softening_pc > 0.0)
+    {
+        printf("Star-star softening eps = %g pc (shells interact softly within %g pc in radius; --star-softening).\n",
+               g_star_softening_pc, STAR_SOFT_KERNEL * g_star_softening_pc);
+        log_message("INFO", "Star-star softening eps = %g pc (--star-softening)", g_star_softening_pc);
+    }
+    if (g_star_substeps > 0 && g_star_substep_method >= 2)
+    {
+        printf("Star sub-step method %d: stars whose radial sweeps overlap in a sub-step are re-integrated jointly "
+               "(at most %d redos per sub-step; radius flips force finer steps and are logged%s; --star-substep-method).\n",
+               g_star_substep_method, STAR_SSC_MAX_REDOS,
+               g_star_substep_method == 3 ? "; clusters with a Levi-Civita member share a Levi-Civita time" : "");
+        log_message("INFO", "Star sub-step method %d (joint cluster re-integration%s, max %d redos)", g_star_substep_method,
+                    g_star_substep_method == 3 ? ", shared Levi-Civita time for Levi-Civita clusters" : "",
+                    STAR_SSC_MAX_REDOS);
+    }
+    else if (g_star_substeps <= 0 && g_star_substep_method >= 2)
+    {
+        printf("Warning: --star-substep-method %d has no effect without --star-substeps.\n", g_star_substep_method);
+        log_message("WARNING", "--star-substep-method %d ignored: star sub-steps are off", g_star_substep_method);
+    }
+
+    // --star-substeps: star-phase and dark-matter-table buffers
+    if (g_star_substeps > 0)
+        allocate_star_substeps(particles, npts, g_star_substeps);
+    // Dark-matter-only M(r) table: the dark-matter field of --star-substeps and the drag density of --drag
+    if (g_star_substeps > 0 || g_enable_drag_force || g_star_dm_rutherford || g_star_star_rutherford)
+        allocate_dm_table(npts, g_menc_smooth_k > 0 ? g_menc_smooth_k : DRAG_DENSITY_KNOTS);
+
+    // --star-star-rutherford: star-rank scratch buffer for the stars of species 1-9
+    if (g_star_star_rutherford)
+    {
+        g_star_star_nstars = 0;
+        int n_other = 0;
+        for (int k = 0; k < npts; k++)
+        {
+            if (star_star_species(particles[P_SPECIES][k]))
+                g_star_star_nstars++;
+            else if (particles[P_SPECIES][k] != 0)
+                n_other++;
+        }
+        g_star_star_rank = (int *)malloc((size_t)(g_star_star_nstars > 0 ? g_star_star_nstars : 1) * sizeof(int));
+        if (!g_star_star_rank)
+        {
+            fprintf(stderr, "ERROR: Failed to allocate the star-star rank buffer\n");
+            CLEAN_EXIT(1);
+        }
+        memset(&g_ssr, 0, sizeof(g_ssr));
+        printf("Star-star Rutherford: %d stars of species 1-%d take part; %d particles of other non-zero species do not.\n",
+               g_star_star_nstars, STAR_MAX_SPECIES, n_other);
+        log_message("INFO", "Star-star Rutherford: %d participating stars, %d non-participating non-DM particles",
+                    g_star_star_nstars, n_other);
+    }
+
+    // --drag: per-step snapshots read by drag_force()
+    if (g_enable_drag_force)
+    {
+        rho_snapshot = (double *)malloc((size_t)npts * sizeof(double));
+        v_sq_snapshot = (double *)malloc((size_t)npts * sizeof(double));
+        vdm_sq_snapshot = (double *)malloc((size_t)npts * sizeof(double));
+        bmax_snapshot = (double *)malloc((size_t)npts * sizeof(double));
+        dm_menc_snapshot = (double *)malloc((size_t)npts * sizeof(double));
+        lmin_snapshot = (double *)malloc((size_t)npts * sizeof(double));
+        drag_dE_rank = (double *)malloc((size_t)npts * sizeof(double));
+        g_reheat_max_stars = 0;
+        for (int k = 0; k < npts; k++)
+            if (particles[P_SPECIES][k] != 0) g_reheat_max_stars++;
+        g_reheat_n = 0;
+        size_t nst = (size_t)(g_reheat_max_stars > 0 ? g_reheat_max_stars : 1);
+        g_reheat_star_id = (int *)malloc(nst * sizeof(int));
+        g_reheat_dE = (double *)malloc(nst * sizeof(double));
+        g_reheat_nstart = (int *)malloc(nst * sizeof(int));
+        g_reheat_start_ids = (int *)malloc(nst * (size_t)(2 * DRAG_REHEATING_BUFFER + 1) * sizeof(int));
+        if (!rho_snapshot || !v_sq_snapshot || !vdm_sq_snapshot || !bmax_snapshot || !dm_menc_snapshot || !lmin_snapshot || !drag_dE_rank ||
+            !g_reheat_star_id || !g_reheat_dE || !g_reheat_nstart || !g_reheat_start_ids)
+        {
+            fprintf(stderr, "ERROR: Failed to allocate the drag snapshots\n");
+            CLEAN_EXIT(1);
+        }
+    }
 
     if (!skip_simulation)
     {
@@ -13154,7 +16718,6 @@ cleanup_diag_iteration:
 #pragma omp single
                 {
                     sort_particles(particles, npts);
-                    rebuild_mass_prefix_sum(particles, npts);
                 }
 
 #pragma omp barrier
@@ -13176,7 +16739,7 @@ cleanup_diag_iteration:
                     double ell = particles[2][i];
                     double drdt = vrad;
 
-                    double force = gravitational_force(r, i, npts, G_CONST, g_active_halo_mass);
+                    double force = gravitational_force(r, g_mass_prefix_sum[i]);
                     double dvdt = force + effective_angular_force(r, ell);
 
                     particles[0][i] += drdt * dt;
@@ -13237,7 +16800,6 @@ cleanup_diag_iteration:
 #pragma omp single
                 {
                     sort_particles(particles, npts);
-                    rebuild_mass_prefix_sum(particles, npts);
                 }
 
 #pragma omp barrier
@@ -13253,7 +16815,7 @@ cleanup_diag_iteration:
                     double r = particles[0][i];
                     double ell = particles[2][i];
 
-                    double force = gravitational_force(r, i, npts, G_CONST, g_active_halo_mass);
+                    double force = gravitational_force(r, g_mass_prefix_sum[i]);
                     double dvdt = force + effective_angular_force(r, ell);
 
                     particles[1][i] += dvdt * dt;
@@ -13311,7 +16873,7 @@ cleanup_diag_iteration:
                     double vrad = particles[1][i];
                     double ell = particles[2][i];
 
-                    double force = gravitational_force(r, i, npts, G_CONST, g_active_halo_mass);
+                    double force = gravitational_force(r, g_mass_prefix_sum[i]);
                     double dvdt = force + effective_angular_force(r, ell);
 
                     particles[1][i] = vrad + 0.5 * dvdt * dt;
@@ -13327,7 +16889,6 @@ cleanup_diag_iteration:
 #pragma omp single
                 {
                     sort_particles(particles, npts);
-                    rebuild_mass_prefix_sum(particles, npts);
                 }
 #pragma omp barrier
 
@@ -13345,7 +16906,7 @@ cleanup_diag_iteration:
                     double vrad = particles[1][i];
                     double ell = particles[2][i];
 
-                    double force = gravitational_force(r, i, npts, G_CONST, g_active_halo_mass);
+                    double force = gravitational_force(r, g_mass_prefix_sum[i]);
                     double dvdt = force + effective_angular_force(r, ell);
 
                     particles[1][i] = vrad + 0.5 * dvdt * dt;
@@ -13412,7 +16973,6 @@ cleanup_diag_iteration:
 #pragma omp single
                 {
                     sort_particles(particles, npts);
-                    rebuild_mass_prefix_sum(particles, npts);
                 }
                 /**
                  * @brief Main integration loop - adaptive leapfrog update for each particle.
@@ -13426,9 +16986,10 @@ cleanup_diag_iteration:
                     double ell = particles[2][i];
 
                     // One full step => h = dt.
-                    double r_new, v_new;
+                    double r_new, v_new, ell_unused, edrag_unused;
+                    MencSource msrc = menc_source_const(g_mass_prefix_sum[i]); // Rank-based M_enc, fixed over the step
                     doAdaptiveFullLeap(
-                        i, npts,
+                        &msrc,
                         r, v,
                         ell,
                         dt,
@@ -13436,7 +16997,8 @@ cleanup_diag_iteration:
                         max_subdiv,
                         G_CONST,
                         out_type,
-                        &r_new, &v_new);
+                        NULL, // no drag (--drag is method 1 only)
+                        &r_new, &v_new, &ell_unused, &edrag_unused);
 
                     particles[0][i] = r_new;
                     particles[1][i] = v_new;
@@ -13523,7 +17085,6 @@ cleanup_diag_iteration:
 #pragma omp single
                 {
                     sort_particles(particles, npts);
-                    rebuild_mass_prefix_sum(particles, npts);
                 }
                 /**
                  * @brief Main integration loop - method selection based on orbital parameters.
@@ -13551,12 +17112,13 @@ cleanup_diag_iteration:
                         r_crit = 0.0;
                     }
 
-                    double r_new, v_new;
+                    double r_new, v_new, ell_unused, edrag_unused;
+                    MencSource msrc = menc_source_const(g_mass_prefix_sum[i]); // Rank-based M_enc, fixed over the step
 
                     if (((r > 1.0e-30) && (r < r_crit)) || (r < r_crit_min))
                     {
                         doLeviCivitaLeapfrog(
-                            i, npts,
+                            &msrc,
                             r, v,
                             ell,
                             dt,
@@ -13567,7 +17129,7 @@ cleanup_diag_iteration:
                     else
                     {
                         doAdaptiveFullLeap(
-                            i, npts,
+                            &msrc,
                             r, v,
                             ell,
                             dt,
@@ -13575,7 +17137,8 @@ cleanup_diag_iteration:
                             max_subdiv,
                             G_CONST,
                             out_type,
-                            &r_new, &v_new);
+                            NULL, // no drag (--drag is method 1 only)
+                            &r_new, &v_new, &ell_unused, &edrag_unused);
                     }
 
                     particles[0][i] = r_new;
@@ -13637,7 +17200,9 @@ cleanup_diag_iteration:
             {
                 double velocity_tol = 1.0e-7;
                 double radius_tol = 1.0e-7;
-                int max_subdiv = 4096 * 4096 * 16;
+                // 2^27: largest power of two for which the Levi-Civita non-convergence
+                // fallback (4*N+1 substeps with N = 2*max_subdiv) still fits in an int.
+                int max_subdiv = 4096 * 4096 * 8;
                 int out_type = 2;
                 int N_taumin = 10;
                 double alpha_param = 0.05;
@@ -13645,7 +17210,45 @@ cleanup_diag_iteration:
 #pragma omp single
                 {
                     sort_particles(particles, npts);
-                    rebuild_mass_prefix_sum(particles, npts);
+
+                    if ((g_menc_field || g_menc_smooth_k > 0) && !g_menc_field_tab)
+                    {
+                        g_menc_field_tab = (MencFieldEntry *)malloc((size_t)(npts + 2) * sizeof(MencFieldEntry));
+                        if (!g_menc_field_tab)
+                        {
+                            fprintf(stderr, "ERROR: Failed to allocate M(r) field buffer\n");
+                            CLEAN_EXIT(1);
+                        }
+                    }
+
+                    // --menc-smooth: rebuild the shared smooth M(r) knot table from the sorted radii
+                    // (with --star-substeps, from the dark matter alone; the stars are added as shells).
+                    // --drag also uses the dark-matter table, for the local density in drag_force(),
+                    // and --star-dm-rutherford / --star-star-rutherford for b_max.
+                    if (g_star_substeps > 0 || g_enable_drag_force || g_star_dm_rutherford || g_star_star_rutherford)
+                        build_dm_smooth_table(particles, npts, g_menc_smooth_k > 0 ? g_menc_smooth_k : DRAG_DENSITY_KNOTS);
+                    if (g_menc_smooth_k > 0 && g_star_substeps == 0)
+                        g_menc_smooth_nk = build_menc_smooth_table(particles[0], g_mass_prefix_sum, npts, g_menc_smooth_k, g_menc_field_tab);
+                }
+
+                // Total particle mass, for the field's "everything enclosed" limit.
+                double menc_field_total = g_mass_prefix_sum[npts - 1] + particles[P_MASS][npts - 1];
+
+                // --menc-field: freeze the start-of-step field (radii ascending after the sort, mass
+                // below each rank, and the interpolation slope) in one packed read-only table for the
+                // M(r) lookups; particles[0] itself is overwritten during integration.
+                if (g_menc_field)
+                {
+#pragma omp parallel for default(shared) schedule(static)
+                    for (int idx = 0; idx < npts; idx++)
+                    {
+                        double r_here = particles[0][idx];
+                        double gap = (idx + 1 < npts) ? (particles[0][idx + 1] - r_here) : 0.0;
+                        g_menc_field_tab[idx].r = r_here;
+                        g_menc_field_tab[idx].M_below = g_mass_prefix_sum[idx];
+                        g_menc_field_tab[idx].slope = (gap > 0.0) ? particles[P_MASS][idx] / gap : 0.0;
+                        g_menc_field_tab[idx].half_m = 0.0;
+                    }
                 }
 
 #pragma omp parallel for default(shared) schedule(static)
@@ -13655,13 +17258,54 @@ cleanup_diag_iteration:
                     inverse_map[orig_id] = idx;
                 }
 
+                // --drag: first deposit the energy drag removed from the stars in the last step into the
+                // dark matter around their start- and end-of-step ranks (velocities only, so this sort
+                // stays valid), then freeze the local density / speed snapshots drag_force() reads for
+                // this step's order (only where they are read; see build_drag_snapshots).
+                if (g_enable_drag_force)
+                {
+                    apply_drag_reheating(particles, npts, inverse_map);
+                    build_drag_snapshots(particles, npts);
+                }
+
                 // SIDM scattering before gravity (uses radius-sorted neighbor list)
                 double current_active_rc_for_sidm = g_use_hernquist_aniso_profile ? g_scale_radius_param : (g_use_nfw_profile ? g_nfw_profile_rc : g_cored_profile_rc);
                 handle_sidm_step(particles, npts, dt, time, current_active_rc_for_sidm, display_method, 0, g_current_timestep_scatter_counts, rng_timestep);
 
-#pragma omp parallel for default(shared) schedule(static)
+                // --star-dm-rutherford: stars scatter off their dark-matter rank neighbours with the
+                // gravitational cross-section (velocities only, so this sort stays valid).
+                if (g_star_dm_rutherford)
+                {
+                    double s_step = 0.0, dE_step = 0.0;
+                    perform_star_dm_rutherford(particles, npts, dt, rng_timestep, g_sidm_seed, &s_step, &dE_step);
+                    g_star_dm_s_total += s_step;
+                    g_star_dm_dE_total += dE_step;
+                    if (g_doDebug)
+                        log_message("DEBUG", "Star-DM Rutherford: sum s = %.6e, star energy lost = %.6e Msun kpc^2/Myr^2 this step",
+                                    s_step, dE_step);
+                }
+
+                // --star-star-rutherford: stars of species 1-9 scatter off their star rank neighbours
+                // (velocities only, so this sort stays valid).
+                if (g_star_star_rutherford)
+                    perform_star_star_rutherford(particles, npts, dt, rng_timestep, g_star_star_seed);
+
+                // --star-substeps: integrate the stars first, in M sub-steps, and keep their radii at
+                // the sub-step boundaries for the dark matter below (run_star_substeps).
+                g_ssc_step = j;
+                if (g_star_substeps > 0)
+                    run_star_substeps(particles, npts, dt, g_star_substeps, alpha_param,
+                                      radius_tol, velocity_tol, max_subdiv, N_taumin, out_type);
+
+                // Dynamic scheduling: particles are radius-sorted and per-particle cost is
+                // concentrated at low rank (inner orbits, Levi-Civita branch), so a static
+                // schedule would hand nearly all the work to the first thread.
+#pragma omp parallel for default(shared) schedule(dynamic, 64)
                 for (int i = 0; i < npts; i++)
                 {
+                    // --star-substeps: the stars were already advanced in run_star_substeps.
+                    if (g_star_substeps > 0 && particles[P_SPECIES][i] != 0)
+                        continue;
                     double r = particles[0][i];
                     double v = particles[1][i];
                     double ell = particles[2][i];
@@ -13674,7 +17318,7 @@ cleanup_diag_iteration:
                         if (i == 0)
                         {
                             // Special handling for i=0 to avoid zero mass in denominator
-                            M_enc = fmax(particles[8][0] * 0.1, 1e-30);
+                            M_enc = 0.1 * particles[P_MASS][0];
                         }
                         else
                         {
@@ -13684,24 +17328,81 @@ cleanup_diag_iteration:
                         r_crit = (ell * ell) * alpha_param / gravPart;
                     }
 
-                    double r_new, v_new;
-                    if (r > 1.0e-30 && r < r_crit) // Switch based on critical radius
+                    // Enclosed-mass source: with --menc-field, M(r) at the particle's current radius
+                    // from the start-of-step radius distribution (own mass excluded, see menc_at);
+                    // otherwise the start-of-step rank, held fixed over the step. The rank-based value
+                    // is the same as the field at the start radius, so r_crit above is unchanged.
+                    // --star-substeps: the dark-matter-only table plus the star shells of this step.
+                    MencSource msrc = g_star_substeps > 0
+                        ? menc_source_split(i, r, particles[P_MASS][i], &g_ss_profile, -1)
+                        : (g_menc_field
+                        ? menc_source_field(i, g_menc_field_tab, npts, menc_field_total, particles[P_MASS][i], g_menc_interp)
+                        : (g_menc_smooth_k > 0
+                               ? menc_source_smooth(i, r, particles[P_MASS][i], g_menc_field_tab, g_menc_smooth_nk, g_menc_smooth_k)
+                               : menc_source_const(g_mass_prefix_sum[i])));
+
+                    // --drag: only particles that feel drag (species != 0) get a drag context; for
+                    // all others the integrators run the drag-free code and return L unchanged.
+                    // Drag is also switched off while the dark-matter mass enclosed by the star is below
+                    // its own mass: there the Chandrasekhar formula (a light body moving through a much
+                    // more massive background) does not apply, and a sunk star would otherwise be driven
+                    // to L = 0 at the centre. Sinking stalls there instead, as in live-halo simulations.
+                    // Only dark matter counts: another sunk star inside the orbit must not re-enable it.
+                    // It is likewise off while |L| is below L_circ at the star's influence radius (see
+                    // build_drag_snapshots): the orbit then reaches inside that radius, so drag cannot
+                    // drive a star onto a purely radial orbit and pin it at the centre.
+                    DragSource dsrc;
+                    const DragSource *drag = NULL;
+                    const int drag_star = g_enable_drag_force && particles[P_SPECIES][i] != 0;
+                    if (drag_star && dm_menc_snapshot[i] >= particles[P_MASS][i] && fabs(ell) >= lmin_snapshot[i])
+                    {
+                        dsrc.rank = i;
+                        dsrc.particles = particles;
+                        dsrc.rho_snapshot = rho_snapshot;
+                        dsrc.vdm_sq_snapshot = vdm_sq_snapshot;
+                        dsrc.bmax_snapshot = bmax_snapshot;
+                        dsrc.G_value = G_CONST;
+                        drag = &dsrc;
+                    }
+
+                    double r_new, v_new, ell_new, edrag_new;
+                    // --drag: a star whose orbit drag has made nearly radial (L below 0.1 of the
+                    // circular-orbit value at its radius) is always integrated with Levi-Civita, which
+                    // regularises the passage through r = 0; leapfrog injects energy there. For L -> 0,
+                    // r_crit -> 0, so the r_crit test alone would send such orbits to leapfrog.
+                    int lc_radial = 0;
+                    if (drag_star && i > 0)
+                    {
+                        double L_circ_sq = (VEL_CONV_SQ * G_CONST) * g_mass_prefix_sum[i] * r;
+                        lc_radial = ell * ell < 0.01 * L_circ_sq;
+                    }
+                    if (r > 1.0e-30 && (r < r_crit || lc_radial)) // Switch based on critical radius
                     {
                         doAdaptiveFullLeviCivita(
-                            i, npts, r, v, ell, dt, N_taumin,
+                            &msrc, r, v, ell, dt, N_taumin,
                             radius_tol, velocity_tol, max_subdiv,
-                            G_CONST, out_type, &r_new, &v_new);
+                            G_CONST, out_type, drag, &r_new, &v_new, &ell_new, &edrag_new);
                     }
                     else
                     {
                         doAdaptiveFullLeap(
-                            i, npts, r, v, ell, dt,
+                            &msrc, r, v, ell, dt,
                             radius_tol, velocity_tol, max_subdiv,
-                            G_CONST, out_type, &r_new, &v_new);
+                            G_CONST, out_type, drag, &r_new, &v_new, &ell_new, &edrag_new);
                     }
                     particles[0][i] = r_new;
                     particles[1][i] = v_new;
+                    particles[2][i] = ell_new; // changes only under drag
+                    // Energy the drag removed from this star this step (Msun kpc^2/Myr^2), deposited
+                    // into the surrounding dark matter after the next sort (apply_drag_reheating).
+                    if (drag_star)
+                        drag_dE_rank[i] = drag ? particles[P_MASS][i] * edrag_new : 0.0;
                 }
+
+                // --drag: record each star's energy loss and its start-of-step heating window while
+                // the arrays are still in this step's order (see record_drag_reheating).
+                if (g_enable_drag_force)
+                    record_drag_reheating(particles, npts);
 
                 // Record trajectory data at every timestep into buffer
 #pragma omp single
@@ -13762,7 +17463,7 @@ cleanup_diag_iteration:
                     double vrad = particles[1][i];
                     double ell = particles[2][i];
 
-                    double force = gravitational_force(r, i, npts, G_CONST, g_active_halo_mass);
+                    double force = gravitational_force(r, g_mass_prefix_sum[i]);
                     double dvdt = force + effective_angular_force(r, ell);
                     particles[1][i] = vrad + 0.5 * c1 * dt * dvdt;
                 }
@@ -13781,7 +17482,6 @@ cleanup_diag_iteration:
 #pragma omp single
                 {
                     sort_particles(particles, npts);
-                    rebuild_mass_prefix_sum(particles, npts);
                 }
 
 #pragma omp barrier
@@ -13803,7 +17503,7 @@ cleanup_diag_iteration:
                     double vrad = particles[1][i];
                     double ell = particles[2][i];
 
-                    double force = gravitational_force(r, i, npts, G_CONST, g_active_halo_mass);
+                    double force = gravitational_force(r, g_mass_prefix_sum[i]);
                     double dvdt = force + effective_angular_force(r, ell);
                     double coeff = 0.5 * (c1 + c2);
                     particles[1][i] = vrad + coeff * dt * dvdt;
@@ -13832,7 +17532,7 @@ cleanup_diag_iteration:
                     double ell = particles[2][i];
 
                     // Recompute acceleration at position after second drift
-                    double force = gravitational_force(r, i, npts, G_CONST, g_active_halo_mass);
+                    double force = gravitational_force(r, g_mass_prefix_sum[i]);
                     double dvdt = force + effective_angular_force(r, ell);
 
                     // Combination of the remaining half of c2 and half of c3.
@@ -13862,7 +17562,7 @@ cleanup_diag_iteration:
                     double vrad = particles[1][i];
                     double ell = particles[2][i];
 
-                    double force = gravitational_force(r, i, npts, G_CONST, g_active_halo_mass);
+                    double force = gravitational_force(r, g_mass_prefix_sum[i]);
                     double dvdt = force + effective_angular_force(r, ell);
                     particles[1][i] = vrad + 0.5 * c3 * dt * dvdt;
                 }
@@ -13946,7 +17646,7 @@ cleanup_diag_iteration:
 
                     double drdt = vrad;
                     // Use the gravitational_force and effective_angular_force functions.
-                    double force = gravitational_force(r, i, npts, G_CONST, g_active_halo_mass);
+                    double force = gravitational_force(r, g_mass_prefix_sum[i]);
                     double dvdt = force + effective_angular_force(r, ell);
 
                     k1r_by_id[orig_id] = drdt;
@@ -13963,7 +17663,7 @@ cleanup_diag_iteration:
 
                     double drdt = v_mid;
                     // Use the gravitational_force and effective_angular_force functions.
-                    double force = gravitational_force(r_mid, i, npts, G_CONST, g_active_halo_mass);
+                    double force = gravitational_force(r_mid, g_mass_prefix_sum[i]);
                     double dvdt = force + effective_angular_force(r_mid, ell);
 
                     k2r_by_id[orig_id] = drdt;
@@ -13973,7 +17673,6 @@ cleanup_diag_iteration:
 #pragma omp single
                 {
                     sort_particles(particles, npts);
-                    rebuild_mass_prefix_sum(particles, npts);
                 }
 
 #pragma omp barrier
@@ -13994,7 +17693,7 @@ cleanup_diag_iteration:
 
                     double drdt = v_mid;
                     // Use the gravitational_force and effective_angular_force functions.
-                    double force = gravitational_force(r_mid, i, npts, G_CONST, g_active_halo_mass);
+                    double force = gravitational_force(r_mid, g_mass_prefix_sum[i]);
                     double dvdt = force + effective_angular_force(r_mid, ell);
 
                     k3r_by_id[orig_id] = drdt;
@@ -14012,7 +17711,7 @@ cleanup_diag_iteration:
 
                     double drdt = v_end;
                     // Use the gravitational_force and effective_angular_force functions.
-                    double force = gravitational_force(r_end, i, npts, G_CONST, g_active_halo_mass);
+                    double force = gravitational_force(r_end, g_mass_prefix_sum[i]);
                     double dvdt = force + effective_angular_force(r_end, ell);
 
                     k4r_by_id[orig_id] = drdt;
@@ -14127,7 +17826,6 @@ cleanup_diag_iteration:
                         for (int sub_step = 0; sub_step <= bootstrap_euler_steps_needed; sub_step++)
                         {
                             sort_particles(particles, npts);
-                            rebuild_mass_prefix_sum(particles, npts);
 #pragma omp parallel for default(shared) schedule(static)
                             for (int idx = 0; idx < npts; idx++)
                             {
@@ -14145,7 +17843,7 @@ cleanup_diag_iteration:
 
                                 double drdt = vrad;
                                 // Use the gravitational_force and effective_angular_force functions.
-                                double force = gravitational_force(rr, i_eval, npts, G_CONST, g_active_halo_mass);
+                                double force = gravitational_force(rr, g_mass_prefix_sum[i_eval]);
                                 double dvdt = force + effective_angular_force(rr, ell);
 
                                 f_ab3_r[sub_step][orig_id] = drdt;
@@ -14171,7 +17869,7 @@ cleanup_diag_iteration:
                                     {
                                         // Calculate derivatives based on current mini-step state
                                         double drdt_m = current_vrad_mini;
-                                        double force_m = gravitational_force(current_r_mini, i_part, npts, G_CONST, g_active_halo_mass);
+                                        double force_m = gravitational_force(current_r_mini, g_mass_prefix_sum[i_part]);
                                         double dvdt_m = force_m + effective_angular_force(current_r_mini, current_ell_mini);
                                         
                                         // Euler update for this mini-step
@@ -14210,7 +17908,6 @@ cleanup_diag_iteration:
 #pragma omp single
                     {
                         sort_particles(particles, npts);
-                        rebuild_mass_prefix_sum(particles, npts);
                     }
 
 #pragma omp barrier
@@ -14270,7 +17967,6 @@ cleanup_diag_iteration:
 #pragma omp single
                     {
                         sort_particles(particles, npts);
-                        rebuild_mass_prefix_sum(particles, npts);
                     }
 #pragma omp barrier
 
@@ -14297,7 +17993,7 @@ cleanup_diag_iteration:
 
                         double drdt = vrad;
                         // Use the gravitational_force and effective_angular_force functions.
-                        double force = gravitational_force(rr, i_dbg, npts, G_CONST, g_active_halo_mass);
+                        double force = gravitational_force(rr, g_mass_prefix_sum[i_dbg]);
                         double dvdt = force + effective_angular_force(rr, ell);
 
                         f_new_r[0][orig_id] = drdt;
@@ -14466,7 +18162,6 @@ cleanup_diag_iteration:
                             double par_ell = particles[2][rank];
                             // Convert cos(phi) and sin(phi) to actual phi angle using atan2
                             double par_phi = atan2(particles[6][rank], particles[5][rank]);
-                            int species = (int)particles[7][rank];
 
                             Rank_block[block_index_apd * npts + orig_id] = rank;
                             R_block[block_index_apd * npts + orig_id] = (float)par_r;
@@ -14475,7 +18170,6 @@ cleanup_diag_iteration:
                             phi_block[block_index_apd * npts + orig_id] = (float)par_phi;
                             scatter_count_block[block_index_apd * npts + orig_id] = g_current_timestep_scatter_counts[orig_id];  // Store scatter count
                             ID_block[block_index_apd * npts + orig_id] = orig_id;  // Store original particle ID
-                            species_block[block_index_apd * npts + orig_id] = species;
 
                             if (g_doDebug)
                             {
@@ -14537,8 +18231,7 @@ cleanup_diag_iteration:
                                                                    L_block,
                                                                    Rank_block,
                                                                    R_block,
-                                                                   Vrad_block,
-                                                                   species_block);
+                                                                   Vrad_block);
                             // Block appended to all_particle_data file
 
                             // Append phi data to separate file
@@ -14564,13 +18257,6 @@ cleanup_diag_iteration:
                                                            npts,
                                                            snapshot_block_size,
                                                            ID_block);
-
-                            char species_filename[1024];
-                            snprintf(species_filename, sizeof(species_filename), "data/all_particle_species%s.dat", g_file_suffix);
-                            append_all_particle_species_to_file(species_filename, 
-                                                                npts, 
-                                                                snapshot_block_size, 
-                                                                species_block);
 
                             // Reset scatter counts for next block
                             memset(scatter_count_block, 0, (size_t)npts * snapshot_block_size * sizeof(int));
@@ -14627,7 +18313,7 @@ cleanup_diag_iteration:
                             if (snapIndex < noutsnaps) {
                                 // The particles array is sorted at this point in the loop
                                 double current_KE, current_PE;
-                                calculate_system_energies(particles, npts, deltaM, &current_KE, &current_PE);
+                                calculate_system_energies(particles, npts, &current_KE, &current_PE);
 
                                 // Store the calculated values in the global arrays
                                 g_time_snapshots[snapIndex] = time;
@@ -14697,8 +18383,7 @@ cleanup_diag_iteration:
                                                            L_block,
                                                            Rank_block,
                                                            R_block,
-                                                           Vrad_block,
-                                                           species_block);
+                                                           Vrad_block);
 
                     // Also flush phi data
                     char phi_filename[1024];
@@ -14723,13 +18408,6 @@ cleanup_diag_iteration:
                                                    npts,
                                                    leftover,
                                                    ID_block);
-
-                    char species_filename[1024];
-                    snprintf(species_filename, sizeof(species_filename), "data/all_particle_species%s.dat", g_file_suffix);
-                    append_all_particle_species_to_file(species_filename, 
-                                                        npts, 
-                                                        leftover, 
-                                                        species_block);
                 }
             }
         }
@@ -15923,10 +19601,27 @@ cleanup_diag_iteration:
                 continue; // Skip to next snapshot.
             }
 
+            // Enclosed mass (inclusive) at each stored rank, from each particle's own mass:
+            // file position ii is particle ID ii, whose mass is g_particle_mass_by_id[ii].
+            double *mass_incl_by_rank = (double *)calloc((size_t)npts, sizeof(double));
+            if (!mass_incl_by_rank)
+            {
+                fprintf(stderr, "[ERROR] Failed to allocate enclosed-mass buffer for snapshot %d\n", snap);
+                CLEAN_EXIT(1);
+            }
             for (int ii = 0; ii < npts; ii++)
             {
                 int rankval = tmpRank_partdata_snap[ii];
-                double massv = (rankval + 1) * deltaM;
+                if (rankval >= 0 && rankval < npts)
+                    mass_incl_by_rank[rankval] += g_particle_mass_by_id[ii];
+            }
+            for (int rr_k = 1; rr_k < npts; rr_k++)
+                mass_incl_by_rank[rr_k] += mass_incl_by_rank[rr_k - 1];
+
+            for (int ii = 0; ii < npts; ii++)
+            {
+                int rankval = tmpRank_partdata_snap[ii];
+                double massv = (rankval >= 0 && rankval < npts) ? mass_incl_by_rank[rankval] : 0.0;
 
                 Rank_unsorted[ii] = rankval;
                 Mass_unsorted[ii] = massv;
@@ -15934,6 +19629,7 @@ cleanup_diag_iteration:
                 Vrad_unsorted[ii] = (double)tmpV_partdata_snap[ii];
                 L_unsorted[ii] = (double)tmpL_partdata_snap[ii];
             }
+            free(mass_incl_by_rank);
 
             // Sort by Rank
             // --- Prepare data structure for sorting by radius ---
@@ -16066,12 +19762,14 @@ cleanup_diag_iteration:
             }
 
             // Populate the sorted arrays using the sorted partarr
+            double mass_running = 0.0;
             for (int ii = 0; ii < npts; ii++)
             {
                 partarr[ii].rank = ii; // Update rank based on sorted position
                 int r_val = partarr[ii].rank; // Rank equals index after sort
                 Rank_sorted[ii] = r_val;
-                Mass_sorted[ii] = (r_val + 1) * deltaM; // Mass enclosed up to this rank
+                mass_running += g_particle_mass_by_id[partarr[ii].original_index];
+                Mass_sorted[ii] = mass_running; // Mass enclosed up to and including this rank
                 R_sorted[ii] = (double)partarr[ii].rad;
                 Vrad_sorted[ii] = (double)partarr[ii].vrad;
                 // Retrieve L from the unsorted array using the original index stored in partarr
@@ -16550,10 +20248,13 @@ cleanup_diag_iteration:
                     rrA[ii] = R_sorted[ii];
                 }
 
+                // inv_rA holds m_i / r_i: each particle's own mass (difference of the cumulative
+                // Mass_sorted) over its radius, so the outer-shell potential sum weights by mass.
                 double *inv_rA = (double *)malloc(npts * sizeof(double));
                 for (int ii = 0; ii < npts; ii++)
                 {
-                    inv_rA[ii] = 1.0 / rrA[ii];
+                    double m_ii = M_rA[ii] - ((ii > 0) ? M_rA[ii - 1] : 0.0);
+                    inv_rA[ii] = m_ii / rrA[ii];
                 }
                 double *suffix_sum_invrA = (double *)malloc(npts * sizeof(double));
                 suffix_sum_invrA[npts - 1] = inv_rA[npts - 1];
@@ -16569,7 +20270,7 @@ cleanup_diag_iteration:
                     double M_r = M_rA[ii];
                     double outer_sum = 0.0;
                     if (ii < npts - 1)
-                        outer_sum = (deltaM)*suffix_sum_invrA[ii + 1];
+                        outer_sum = suffix_sum_invrA[ii + 1];
                     double psiA = G_CONST * ((M_r / rr) + outer_sum);
                     psiA *= VEL_CONV_SQ;
                     psiAarr[ii] = psiA;
@@ -16581,7 +20282,7 @@ cleanup_diag_iteration:
                 {
                     sum_invr += inv_rA[ii];
                 }
-                double PsiA0 = G_CONST * deltaM * sum_invr * VEL_CONV_SQ; // PsiA at r=0.
+                double PsiA0 = G_CONST * sum_invr * VEL_CONV_SQ; // PsiA at r=0 (sum of m_i / r_i).
 
                 // Write the calculated potential profile to a file.
                 char fname_PsiA[256];
@@ -16930,10 +20631,43 @@ cleanup_diag_iteration:
         g_rng = NULL;
     }
 
-    for (i = 0; i < N_PARTICLE_PARAMS; i++)  // N_PARTICLE_PARAMS rows for further extended particle state
+    for (i = 0; i < N_PARTICLE_FIELDS; i++)  // All rows of the particle state
     {
         free(particles[i]);
     }
+    // Free per-particle tables (enclosed-mass prefix sum, species/mass by ID)
+    free(g_mass_prefix_sum);
+    g_mass_prefix_sum = NULL;
+    g_mass_prefix_n = 0;
+    free(g_particle_mass_by_id);
+    g_particle_mass_by_id = NULL;
+    free(g_particle_species_by_id);
+    g_particle_species_by_id = NULL;
+    free(rho_snapshot);
+    rho_snapshot = NULL;
+    free(v_sq_snapshot);
+    free(vdm_sq_snapshot);
+    vdm_sq_snapshot = NULL;
+    free(bmax_snapshot);
+    bmax_snapshot = NULL;
+    free(dm_menc_snapshot);
+    dm_menc_snapshot = NULL;
+    free(lmin_snapshot);
+    lmin_snapshot = NULL;
+    free_star_substeps(g_star_substeps);
+    free_dm_table();
+    free(drag_dE_rank);
+    drag_dE_rank = NULL;
+    free(g_reheat_star_id);
+    free(g_reheat_dE);
+    free(g_reheat_nstart);
+    free(g_reheat_start_ids);
+    g_reheat_star_id = NULL;
+    g_reheat_dE = NULL;
+    g_reheat_nstart = NULL;
+    g_reheat_start_ids = NULL;
+    v_sq_snapshot = NULL;
+
     free(particles);
 
     // Write total energy diagnostics to file if data was generated
@@ -16975,6 +20709,66 @@ cleanup_diag_iteration:
         log_message("INFO", "Total SIDM scattering events: %lld", g_total_sidm_scatters);
     }
 #endif
+    if (g_star_dm_rutherford) {
+        printf("Star-DM Rutherford scattering: %.6e momentum-transfer collisions, star energy lost %.6e Msun kpc^2/Myr^2\n",
+               g_star_dm_s_total, g_star_dm_dE_total);
+        log_message("INFO", "Star-DM Rutherford: sum s = %.6e, star energy lost = %.6e Msun kpc^2/Myr^2",
+                    g_star_dm_s_total, g_star_dm_dE_total);
+        for (int sp = 1; sp < 4; sp++) {
+            const double *sat = g_star_dm_sat[sp];
+            if (sat[3] <= 0.0) continue;
+            printf("  species %d%s: %.0f pairs, sum s = %.6e, sum (1 - e^-s) = %.6e (ratio %.4f), "
+                   "share of sum s from pairs with s > 0.1: %.4f, mean s = %.3e\n",
+                   sp, sp == 3 ? "+" : "", sat[3], sat[0], sat[1], sat[1] / sat[0], sat[2] / sat[0], sat[0] / sat[3]);
+        }
+    }
+    if (g_star_substeps > 0 && g_star_substep_method >= 2) {
+        printf("Star sub-step clusters (--star-substep-method %d): %lld sub-steps with clusters, %lld joint integrations "
+               "(%lld star integrations; size 2/3/4/5-8/9-16/>16: %lld/%lld/%lld/%lld/%lld/%lld, max %d), "
+               "%lld with a Levi-Civita member, skipped (drag) %lld, not converged %lld, extrapolated r <= 0 %lld, redo-limit hits %lld, wall time %.3f s\n",
+               g_star_substep_method, g_ssc.substeps, g_ssc.clusters, g_ssc.star_integrations, g_ssc.size_hist[0], g_ssc.size_hist[1],
+               g_ssc.size_hist[2], g_ssc.size_hist[3], g_ssc.size_hist[4], g_ssc.size_hist[5], g_ssc.max_size,
+               g_ssc.lc_clusters, g_ssc.skip_drag, g_ssc.nonconv, g_ssc.neg_r, g_ssc.redo_hist[STAR_SSC_MAX_REDOS + 1], g_ssc.time_total);
+        printf("  radius flips: %lld joint integrations (%lld doublings of N forced, %lld still flipping at the cap); "
+               "Levi-Civita path: %lld joint integrations (%lld with 2+ anchors), %lld stars promoted to anchors after "
+               "flips, %lld unconverged clusters redone with all members as anchors\n",
+               g_ssc.flip_integrations, g_ssc.flip_doublings, g_ssc.flip_unresolved, g_ssc.lc_path, g_ssc.lc_multi,
+               g_ssc.promoted, g_ssc.promoted_nonconv);
+        log_message("INFO", "Star sub-step clusters: radius flips in %lld joint integrations (%lld forced doublings, %lld "
+                    "unresolved), Levi-Civita path %lld (%lld multi-anchor), %lld promoted", g_ssc.flip_integrations,
+                    g_ssc.flip_doublings, g_ssc.flip_unresolved, g_ssc.lc_path, g_ssc.lc_multi, g_ssc.promoted);
+        printf("  sub-steps with clusters by redo rounds 0..%d:", STAR_SSC_MAX_REDOS);
+        for (int k = 0; k <= STAR_SSC_MAX_REDOS; k++)
+            printf(" %lld", g_ssc.redo_hist[k]);
+        printf("\n");
+        log_message("INFO", "Star sub-step clusters: %lld sub-steps, %lld joint integrations (max size %d), %lld with LC member, skipped %lld drag, "
+                    "not converged %lld, redo-limit hits %lld, wall %.3f s",
+                    g_ssc.substeps, g_ssc.clusters, g_ssc.max_size, g_ssc.lc_clusters, g_ssc.skip_drag, g_ssc.nonconv,
+                    g_ssc.redo_hist[STAR_SSC_MAX_REDOS + 1], g_ssc.time_total);
+    }
+    if (g_star_star_rutherford) {
+        printf("Star-star Rutherford scattering: %lld steps, sum s = %.6e, visits with s > 1: %.0f, "
+               "max per-step |dK|/K = %.3e, wall time %.3f s (%.3f ms/step)\n",
+               g_ssr.steps, g_ssr.s_total, g_ssr.n_big_s, g_ssr.max_rel_dE, g_ssr.time_total,
+               g_ssr.steps > 0 ? 1e3 * g_ssr.time_total / (double)g_ssr.steps : 0.0);
+        log_message("INFO", "Star-star Rutherford: %lld steps, sum s = %.6e, visits with s > 1: %.0f, max |dK|/K = %.3e, wall %.3f s",
+                    g_ssr.steps, g_ssr.s_total, g_ssr.n_big_s, g_ssr.max_rel_dE, g_ssr.time_total);
+        for (int p = 1; p <= STAR_MAX_SPECIES; p++) {
+            for (int q = p; q <= STAR_MAX_SPECIES; q++) {
+                const double *sat = g_ssr.pair_sat[p][q];
+                if (sat[2] <= 0.0) continue;
+                printf("  species %d-%d: %.0f visits, sum s = %.6e, sum (1 - e^-s) = %.6e (ratio %.4f), mean s = %.3e\n",
+                       p, q, sat[2], sat[0], sat[1], sat[1] / sat[0], sat[0] / sat[2]);
+            }
+        }
+        for (int sp = 1; sp <= STAR_MAX_SPECIES; sp++) {
+            if (g_ssr.dK_species[sp] == 0.0) continue;
+            printf("  species %d kinetic energy gained in star-star scatters: %+.6e Msun kpc^2/Myr^2\n", sp, g_ssr.dK_species[sp]);
+            log_message("INFO", "Star-star Rutherford: species %d gained %+.6e Msun kpc^2/Myr^2", sp, g_ssr.dK_species[sp]);
+        }
+    }
+    free(g_star_star_rank);
+    g_star_star_rank = NULL;
 
 
     // Cleanup for the conditionally declared persistent sort buffer.
@@ -17648,8 +21442,8 @@ double om_mu_integrand(double mu, void *params) {
 // =============================================================================
 //
 // Functions implementing parallel sorting algorithms.
-// The sorting implementation uses a parallel chunk-based approach with overlapping
-// regions between chunks to ensure correct ordering at chunk boundaries.
+// The sorting implementation uses a parallel chunk-based approach: each chunk is
+// sorted independently, then the sorted chunks are merged (merge_sorted_chunks).
 // Constants controlling behavior are defined at the top of this file.
 
 /**
@@ -17733,7 +21527,7 @@ static void quadsort_wrapper(double **columns, int n)
  * @brief Performs insertion sort on a subarray of particle data.
  *
  * @details Operates on range `[start..end]` inclusive within the columns array.
- *          Used by parallel sorting algorithms to sort individual chunks and seam regions.
+ *          Used by the parallel insertion sort to sort individual chunks.
  *
  * @param columns 2D array of particle data containing the target subarray (`double**`).
  * @param start Starting index of the subarray (inclusive).
@@ -17755,10 +21549,100 @@ static void insertion_sort_sub(double **columns, int start, int end)
 }
 
 /**
- * Parallel insertion sort implementation using chunk-based approach with overlap.
+ * @brief Merges consecutive, individually sorted chunks into one globally sorted array.
+ * @details Final stage of the parallel sorts. The chunks `[startIdx[c], startIdx[c+1])` are
+ *          each sorted by radius on entry. They are combined by rounds of pairwise merges
+ *          (chunk pairs, then pairs of pairs, ...), alternating between `columns` and a
+ *          scratch buffer. All merges within a round touch disjoint ranges and run in
+ *          parallel. The result is exactly sorted for any input, unlike re-sorting a fixed
+ *          overlap window around each chunk boundary, which leaves elements out of place
+ *          whenever they belong farther across a boundary than the window reaches.
+ *
+ *          A pair whose boundary is already in order (last of left <= first of right) is
+ *          copied rather than merged, so nearly sorted input stays cheap. Ties take the left
+ *          element first, so the merge is stable.
+ *
+ * @param columns   [in,out] Array of `n` particle row pointers; sorted by radius on return.
+ * @param n         [in] Number of particles.
+ * @param startIdx  [in] Start index of each chunk (ascending; chunk c ends where c+1 starts).
+ * @param nsections [in] Number of chunks.
+ *
+ * @note Falls back to a serial quadsort of the whole array if the scratch buffer cannot be
+ *       allocated.
+ */
+static void merge_sorted_chunks(double **columns, int n, const int *startIdx, int nsections)
+{
+    if (nsections <= 1 || n <= 1)
+        return;
+
+    double **buffer = (double **)malloc((size_t)n * sizeof(double *));
+    int *bounds = (int *)malloc((size_t)(nsections + 1) * sizeof(int));
+    if (!buffer || !bounds)
+    {
+        free(buffer);
+        free(bounds);
+        quadsort_wrapper(columns, n);
+        return;
+    }
+
+    for (int c = 0; c < nsections; c++)
+        bounds[c] = startIdx[c];
+    bounds[nsections] = n;
+
+    double **src = columns;
+    double **dst = buffer;
+
+    for (int width = 1; width < nsections; width *= 2)
+    {
+        int pair_step = 2 * width;
+
+#pragma omp parallel for schedule(dynamic)
+        for (int c = 0; c < nsections; c += pair_step)
+        {
+            int mid_c = (c + width < nsections) ? (c + width) : nsections;
+            int hi_c = (c + pair_step < nsections) ? (c + pair_step) : nsections;
+            int lo = bounds[c];
+            int mid = bounds[mid_c];
+            int hi = bounds[hi_c];
+
+            // No right run, or the two runs are already in order: copy through.
+            if (mid >= hi || mid <= lo || src[mid - 1][0] <= src[mid][0])
+            {
+                memcpy(dst + lo, src + lo, (size_t)(hi - lo) * sizeof(double *));
+                continue;
+            }
+
+            int a = lo, b = mid, k = lo;
+            while (a < mid && b < hi)
+            {
+                if (src[b][0] < src[a][0])
+                    dst[k++] = src[b++];
+                else
+                    dst[k++] = src[a++];
+            }
+            while (a < mid)
+                dst[k++] = src[a++];
+            while (b < hi)
+                dst[k++] = src[b++];
+        }
+
+        double **tmp = src;
+        src = dst;
+        dst = tmp;
+    }
+
+    if (src != columns)
+        memcpy(columns, src, (size_t)n * sizeof(double *));
+
+    free(buffer);
+    free(bounds);
+}
+
+/**
+ * Parallel insertion sort implementation using a chunk-based approach.
  *
  * Divides the data into num_sort_sections chunks, sorts each chunk in parallel,
- * then fixes the boundaries between chunks by re-sorting overlap regions.
+ * then merges the sorted chunks (see merge_sorted_chunks) into a globally sorted array.
  * This approach balances parallelism with the need to ensure properly sorted output.
  *
  * @param columns 2D array of particle data to be sorted
@@ -17768,8 +21652,8 @@ static void insertion_sort_sub(double **columns, int start, int end)
  * @brief Parallel implementation of insertion sort algorithm optimized for particle sorting.
  *
  * @details Uses multiple OpenMP threads to sort sections of particle data in parallel, 
- * followed by seam-fixing operations to ensure global ordering. Includes dynamic section
- * calculation and optimized overlap sizing based on chunk characteristics.
+ * followed by parallel pairwise merges of the sorted sections (merge_sorted_chunks), which
+ * guarantees global ordering for any input. Includes dynamic section calculation.
  *
  * @param columns Column-major data array [particle][component]
  * @param n Number of particles to sort
@@ -17798,8 +21682,6 @@ void insertion_parallel_sort(double **columns, int n)
     if (n < PARALLEL_SORT_MIN_CHUNK_SIZE_THRESHOLD || \
         active_num_sort_sections <= 1 || \
         estimated_avg_chunk_size < PARALLEL_SORT_MIN_CHUNK_SIZE_THRESHOLD) {
-        // If PARALLEL_SORT_MIN_CHUNK_SIZE_THRESHOLD is set carefully (e.g. >= 2 * PARALLEL_SORT_MIN_CORRECTNESS_OVERLAP),
-        // this also helps ensure chunks are large enough for meaningful overlap.
         insertion_sort(columns, n); // Call serial insertion sort
         return;
     }
@@ -17827,89 +21709,10 @@ void insertion_parallel_sort(double **columns, int n)
         insertion_sort_sub(columns, startIdx[c], endIdx[c]);
     }
 
-    // Calculate minChunkSize based on actual chunk distribution using active_num_sort_sections
-    int minChunkSize = n; 
-    if (active_num_sort_sections > 0 && n > 0 && endIdx && startIdx) { // Check endIdx/startIdx validity
-        minChunkSize = (endIdx[0] - startIdx[0] + 1);
-        for (int c = 1; c < active_num_sort_sections; c++) {
-            int csize = endIdx[c] - startIdx[c] + 1;
-            if (csize < minChunkSize) minChunkSize = csize;
-        }
-    }
-    if (minChunkSize <= 0 && n > 0) minChunkSize = 1; // Safety for valid n
-
-    int overlapSize;
-    if (n <= 1 || active_num_sort_sections <= 1 || minChunkSize <= 0) {
-        overlapSize = 0; 
-    } else {
-        int proportional_overlap = minChunkSize / PARALLEL_SORT_OVERLAP_DIVISOR;
-        if (proportional_overlap == 0 && minChunkSize > 0) {
-            proportional_overlap = 1; 
-        }
-
-        // Ensure overlap is at least the minimum required for correctness,
-        // but only if that minimum does not make overlap excessive for chunk size
-        if (PARALLEL_SORT_MIN_CORRECTNESS_OVERLAP > 0 && proportional_overlap < PARALLEL_SORT_MIN_CORRECTNESS_OVERLAP) {
-            overlapSize = PARALLEL_SORT_MIN_CORRECTNESS_OVERLAP;
-        } else {
-            overlapSize = proportional_overlap;
-        }
-
-        // Cap overlap at 50% of smallest chunk size
-        // Handles cases where MIN_CORRECTNESS_OVERLAP exceeds chunk capacity
-        int max_permissible_relative_overlap = minChunkSize / 2; // Example: Cap at 50% of chunk
-        if (max_permissible_relative_overlap < 1 && minChunkSize > 0) max_permissible_relative_overlap = 1; // Ensure cap is at least 1 if chunk exists
-
-        if (overlapSize > max_permissible_relative_overlap && minChunkSize > 1) {
-            overlapSize = max_permissible_relative_overlap;
-        }
-        
-        // Ensure minimum overlap when using multiple sections with valid data
-        if (overlapSize == 0 && minChunkSize > 0 && active_num_sort_sections > 1) {
-             overlapSize = 1; 
-        }
-    }
-    if (overlapSize < 0) overlapSize = 0; // Final safety check
-    // Additional absolute cap based on total N, mostly for sanity with very few sections.
-    if (n > 1 && overlapSize > n / 2) overlapSize = n / 2;
-
-
-    // Optional debug print (controlled by DEBUG_SORT_PARAMS environment variable)
-    if (getenv("DEBUG_SORT_PARAMS") != NULL) {
-        #ifdef _OPENMP
-        if (omp_get_thread_num() == 0) // Print only from one thread
-        #endif
-        {
-            printf("[NSPHERE_IS_PARALLEL_DEBUG] N=%d, Sections=%d, MinChunkSz=%d, OverlapSize=%d (Using DIV:%d, MIN_CORRECT:%d)\n",
-                   n, active_num_sort_sections, minChunkSize, overlapSize,
-                   PARALLEL_SORT_OVERLAP_DIVISOR, PARALLEL_SORT_MIN_CORRECTNESS_OVERLAP);
-            fflush(stdout);
-        }
-    }
-
-    // Merge/fix the seams in parallel
-    int nSeams = active_num_sort_sections - 1;
-    if (overlapSize > 0 && nSeams > 0) {
-#pragma omp parallel for schedule(dynamic)
-        for (int s = 0; s < nSeams; s++)
-        {
-            int c_left = s;
-            int c_right = s + 1;
-
-            // Robust boundary calculations for seam sorting
-            int seam_sort_start = endIdx[c_left] - overlapSize + 1;
-            if (seam_sort_start < startIdx[c_left]) seam_sort_start = startIdx[c_left];
-
-            int seam_sort_end = startIdx[c_right] + overlapSize - 1;
-            if (seam_sort_end > endIdx[c_right]) seam_sort_end = endIdx[c_right];
-
-            // Sort the combined overlap region
-            if (seam_sort_start <= seam_sort_end)
-            {
-                insertion_sort_sub(columns, seam_sort_start, seam_sort_end);
-            }
-        }
-    }
+    // Merge the sorted chunks into one globally sorted array. (Re-sorting a fixed overlap
+    // window around each chunk boundary is NOT sufficient: any element that belongs more than
+    // one window-width across a boundary would be left out of place.)
+    merge_sorted_chunks(columns, n, startIdx, active_num_sort_sections);
 
     free(startIdx);
     free(endIdx);
@@ -18078,9 +21881,9 @@ cleanup:
 }
 
 /**
- * Parallel quadsort implementation using chunk-based approach with overlap.
+ * Parallel quadsort implementation using a chunk-based approach.
  *
- * Uses quadsort algorithm for both initial chunk sorting and seam fixing,
+ * Uses quadsort to sort each chunk, then merges the sorted chunks (merge_sorted_chunks),
  * providing better performance than insertion sort for large datasets
  * while maintaining sort stability.
  *
@@ -18091,8 +21894,8 @@ cleanup:
  * @brief Parallel implementation of quadsort algorithm optimized for particle sorting.
  *
  * @details Uses multiple OpenMP threads to sort sections of particle data in parallel, 
- * followed by seam-fixing operations to ensure global ordering. Includes dynamic section
- * calculation and optimized overlap sizing based on chunk characteristics.
+ * followed by parallel pairwise merges of the sorted sections (merge_sorted_chunks), which
+ * guarantees global ordering for any input. Includes dynamic section calculation.
  *
  * @param columns Column-major data array [particle][component]
  * @param n Number of particles to sort
@@ -18121,8 +21924,6 @@ void quadsort_parallel_sort(double **columns, int n)
     if (n < PARALLEL_SORT_MIN_CHUNK_SIZE_THRESHOLD || \
         active_num_sort_sections <= 1 || \
         estimated_avg_chunk_size < PARALLEL_SORT_MIN_CHUNK_SIZE_THRESHOLD) {
-        // If PARALLEL_SORT_MIN_CHUNK_SIZE_THRESHOLD is set carefully (e.g. >= 2 * PARALLEL_SORT_MIN_CORRECTNESS_OVERLAP),
-        // this also helps ensure chunks are large enough for meaningful overlap.
         quadsort_wrapper(columns, n); // Call serial quadsort wrapper
         return;
     }
@@ -18150,92 +21951,10 @@ void quadsort_parallel_sort(double **columns, int n)
         quadsort(&columns[startIdx[c]], endIdx[c] - startIdx[c] + 1, sizeof(double *), compare_particles);
     }
 
-    // Calculate minChunkSize based on actual chunk distribution using active_num_sort_sections
-    int minChunkSize = n; 
-    if (active_num_sort_sections > 0 && n > 0 && endIdx && startIdx) { // Check endIdx/startIdx validity
-        minChunkSize = (endIdx[0] - startIdx[0] + 1);
-        for (int c = 1; c < active_num_sort_sections; c++) {
-            int csize = endIdx[c] - startIdx[c] + 1;
-            if (csize < minChunkSize) minChunkSize = csize;
-        }
-    }
-    if (minChunkSize <= 0 && n > 0) minChunkSize = 1; // Safety for valid n
-
-    int overlapSize;
-    if (n <= 1 || active_num_sort_sections <= 1 || minChunkSize <= 0) {
-        overlapSize = 0; 
-    } else {
-        int proportional_overlap = minChunkSize / PARALLEL_SORT_OVERLAP_DIVISOR;
-        if (proportional_overlap == 0 && minChunkSize > 0) {
-            proportional_overlap = 1; 
-        }
-
-        // Ensure overlap is at least the minimum required for correctness,
-        // but only if that minimum does not make overlap excessive for chunk size
-        if (PARALLEL_SORT_MIN_CORRECTNESS_OVERLAP > 0 && proportional_overlap < PARALLEL_SORT_MIN_CORRECTNESS_OVERLAP) {
-            overlapSize = PARALLEL_SORT_MIN_CORRECTNESS_OVERLAP;
-        } else {
-            overlapSize = proportional_overlap;
-        }
-
-        // Cap overlap at 50% of smallest chunk size
-        // Handles cases where MIN_CORRECTNESS_OVERLAP exceeds chunk capacity
-        int max_permissible_relative_overlap = minChunkSize / 2; // Example: Cap at 50% of chunk
-        if (max_permissible_relative_overlap < 1 && minChunkSize > 0) max_permissible_relative_overlap = 1; // Ensure cap is at least 1 if chunk exists
-
-        if (overlapSize > max_permissible_relative_overlap && minChunkSize > 1) {
-            overlapSize = max_permissible_relative_overlap;
-        }
-        
-        // Ensure minimum overlap when using multiple sections with valid data
-        if (overlapSize == 0 && minChunkSize > 0 && active_num_sort_sections > 1) {
-             overlapSize = 1; 
-        }
-    }
-    if (overlapSize < 0) overlapSize = 0; // Final safety check
-    // Additional absolute cap based on total N, mostly for sanity with very few sections.
-    if (n > 1 && overlapSize > n / 2) overlapSize = n / 2;
-
-
-    // Optional debug print (controlled by DEBUG_SORT_PARAMS environment variable)
-    if (getenv("DEBUG_SORT_PARAMS") != NULL) {
-        #ifdef _OPENMP
-        if (omp_get_thread_num() == 0) // Print only from one thread
-        #endif
-        {
-            printf("[NSPHERE_QS_PARALLEL_DEBUG] N=%d, Sections=%d, MinChunkSz=%d, OverlapSize=%d (Using DIV:%d, MIN_CORRECT:%d)\n",
-                   n, active_num_sort_sections, minChunkSize, overlapSize,
-                   PARALLEL_SORT_OVERLAP_DIVISOR, PARALLEL_SORT_MIN_CORRECTNESS_OVERLAP);
-            fflush(stdout);
-        }
-    }
-
-    // Merge/fix the seams in parallel using quadsort
-    int nSeams = active_num_sort_sections - 1;
-    if (overlapSize > 0 && nSeams > 0) {
-#pragma omp parallel for schedule(dynamic)
-        for (int s = 0; s < nSeams; s++)
-        {
-            int c_left = s;
-            int c_right = s + 1;
-
-            // Robust boundary calculations for seam sorting
-            int seam_sort_start = endIdx[c_left] - overlapSize + 1;
-            if (seam_sort_start < startIdx[c_left]) seam_sort_start = startIdx[c_left];
-
-            int seam_sort_end = startIdx[c_right] + overlapSize - 1;
-            if (seam_sort_end > endIdx[c_right]) seam_sort_end = endIdx[c_right];
-
-            // Sort the combined overlap region
-            if (seam_sort_start <= seam_sort_end)
-            {
-                int seam_len = seam_sort_end - seam_sort_start + 1;
-                if (seam_len > 1) {  // Only sort if multiple elements exist
-                    quadsort(&columns[seam_sort_start], seam_len, sizeof(double *), compare_particles);
-                }
-            }
-        }
-    }
+    // Merge the sorted chunks into one globally sorted array. (Re-sorting a fixed overlap
+    // window around each chunk boundary is NOT sufficient: any element that belongs more than
+    // one window-width across a boundary would be left out of place.)
+    merge_sorted_chunks(columns, n, startIdx, active_num_sort_sections);
 
     free(startIdx);
     free(endIdx);
@@ -18349,7 +22068,7 @@ void sort_particles_with_alg(double **particles, int npts, const char *sortAlg)
         
         // Allocate sub-arrays for each particle's components
         for (int i = 0; i < npts; i++) {
-            g_sort_columns_buffer[i] = (double *)malloc(N_PARTICLE_PARAMS * sizeof(double));  // All N_PARTICLE_PARAMS components including cos(phi) and sin(phi)
+            g_sort_columns_buffer[i] = (double *)malloc(N_PARTICLE_FIELDS * sizeof(double));  // All components, incl. cos/sin(phi), species, mass
             if (!g_sort_columns_buffer[i]) {
                 fprintf(stderr, "ERROR: Malloc failed for g_sort_columns_buffer[%d] in sort_particles_with_alg\n", i);
                 // Clean up partial allocation
@@ -18365,7 +22084,7 @@ void sort_particles_with_alg(double **particles, int npts, const char *sortAlg)
     // Transpose data from row-major (particles) to column-major (g_sort_columns_buffer)
     #pragma omp parallel for
     for (int i = 0; i < npts; i++) {
-        for (int j = 0; j < N_PARTICLE_PARAMS; j++) {  // All N_PARTICLE_PARAMS components including cos(phi) and sin(phi)
+        for (int j = 0; j < N_PARTICLE_FIELDS; j++) {  // All components, incl. cos/sin(phi), species, mass
             g_sort_columns_buffer[i][j] = particles[j][i];
         }
     }
@@ -18409,8 +22128,8 @@ void sort_particles_with_alg(double **particles, int npts, const char *sortAlg)
             // Allocate and copy data
             int alloc_failed = 0;
             for (int i = 0; i < npts && !alloc_failed; i++) {
-                copy1[i] = (double *)malloc(N_PARTICLE_PARAMS * sizeof(double));
-                copy2[i] = (double *)malloc(N_PARTICLE_PARAMS * sizeof(double));
+                copy1[i] = (double *)malloc(N_PARTICLE_FIELDS * sizeof(double));
+                copy2[i] = (double *)malloc(N_PARTICLE_FIELDS * sizeof(double));
                 if (!copy1[i] || !copy2[i]) {
                     alloc_failed = 1;
                     // Cleanup
@@ -18420,7 +22139,7 @@ void sort_particles_with_alg(double **particles, int npts, const char *sortAlg)
                     }
                 }
                 if (!alloc_failed) {
-                    for (int j = 0; j < N_PARTICLE_PARAMS; j++) {
+                    for (int j = 0; j < N_PARTICLE_FIELDS; j++) {
                         copy1[i][j] = columns_to_sort_on[i][j];
                         copy2[i][j] = columns_to_sort_on[i][j];
                     }
@@ -18539,7 +22258,7 @@ void sort_particles_with_alg(double **particles, int npts, const char *sortAlg)
     // Transpose sorted data back to the original format
     #pragma omp parallel for
     for (int i = 0; i < npts; i++) {
-        for (int j = 0; j < N_PARTICLE_PARAMS; j++) {  // All N_PARTICLE_PARAMS components including cos(phi) and sin(phi) and future development
+        for (int j = 0; j < N_PARTICLE_FIELDS; j++) {  // All components, incl. cos/sin(phi), species, mass
             particles[j][i] = columns_to_sort_on[i][j];
         }
     }
@@ -18559,19 +22278,40 @@ void sort_particles_with_alg(double **particles, int npts, const char *sortAlg)
 void sort_particles(double **particles, int npts)
 {
     sort_particles_with_alg(particles, npts, g_defaultSortAlg);
+    rebuild_mass_prefix_sum(particles, npts);
 }
 
 /**
- * @brief Convenience wrapper function for rebuilding of the mass prefix sum.
- * @details Assumes the particles array is sorted by rank. Calculates a rank-based cumulative sum of masses.
+ * @brief Rebuilds g_mass_prefix_sum (enclosed mass per rank) for the current particle order.
+ * @details g_mass_prefix_sum[i] = sum of particles[P_MASS][0..i-1]. Called by `sort_particles`
+ *          after every sort and once before the time loop, so rank-based forces always see the
+ *          masses of the particles actually below them. Grows the buffer if `npts` increased.
  *
- * @param particles [in,out] 2D array of particle data [component][particle].
- * @param npts [in] Number of particles to sum.
+ * @param particles [in] Particle array (row P_MASS is read).
+ * @param npts      [in] Number of particles.
  */
-static inline void rebuild_mass_prefix_sum(double **particles, int npts) {
-    g_mass_prefix_sum[0] = 0.0;
-    for (int i = 1; i < npts; i++)
-        g_mass_prefix_sum[i] = g_mass_prefix_sum[i - 1] + particles[8][i - 1];
+static void rebuild_mass_prefix_sum(double **particles, int npts)
+{
+    if (npts <= 0)
+        return;
+    if (g_mass_prefix_n < npts)
+    {
+        double *buf = (double *)realloc(g_mass_prefix_sum, (size_t)npts * sizeof(double));
+        if (!buf)
+        {
+            fprintf(stderr, "ERROR: Failed to allocate the enclosed-mass prefix sum\n");
+            CLEAN_EXIT(1);
+        }
+        g_mass_prefix_sum = buf;
+        g_mass_prefix_n = npts;
+    }
+    const double *m = particles[P_MASS];
+    double running = 0.0;
+    for (int i = 0; i < npts; i++)
+    {
+        g_mass_prefix_sum[i] = running;
+        running += m[i];
+    }
 }
 
 /**
@@ -18757,51 +22497,109 @@ threevector crossproduct(threevector X, threevector Y) {
 }
 
 /**
- * @brief Calculates the total kinetic and potential energy of the N-body system.
- * @details This function iterates over all particles to compute the system's total
- *          kinetic energy (KE) and potential energy (PE) at a specific snapshot in time.
- *          The `particles` array must be sorted by radius before calling this function
- *          to ensure the rank-based potential energy calculation is correct.
- *
- * @param particles         [in] The main particle data array, sorted by radius.
- * @param npts              [in] The total number of particles in the simulation.
- * @param deltaM            [in] The mass of a single particle (\f$M_{\odot}\f$).
- * @param total_KE_out      [out] Pointer to store the calculated total kinetic energy.
- * @param total_PE_out      [out] Pointer to store the calculated total potential energy.
+ * @brief Comparison for pointers into one array of doubles: by value, ties by address (deterministic).
  */
-static void calculate_system_energies(double** particles, int npts, double deltaM,
+static int compare_double_ptr_values(const void *a, const void *b)
+{
+    const double *pa = *(const double *const *)a;
+    const double *pb = *(const double *const *)b;
+    if (*pa < *pb) return -1;
+    if (*pa > *pb) return 1;
+    return (pa > pb) - (pa < pb);
+}
+
+/**
+ * @brief Calculates the total kinetic and potential energy of the N-body system.
+ * @details Computes the energy of the spherical-shell system at a snapshot from each particle's
+ *          own mass `particles[P_MASS][i]`:
+ *          - \f$KE = \sum_i \tfrac{1}{2} m_i (v_{r,i}^2 + L_i^2/r_i^2)\f$
+ *          - \f$PE = -G \sum_i m_i M_{<i} / r_i\f$, where \f$M_{<i}\f$ is the mass of all
+ *            particles at smaller *current* radius, i.e. \f$-G \sum_{pairs} m_i m_j / \max(r_i, r_j)\f$.
+ *          This is the energy conserved by the integrators, whose force on particle i is
+ *          \f$-G M_{<i} / r_i^2\f$ (own mass excluded). A shell self-energy term
+ *          \f$-G m_i^2 / (2 r_i)\f$ is deliberately not included: the dynamics does not contain it,
+ *          and with unequal masses it would change whenever a heavy particle changes radius.
+ *          The current radii are ranked here (an index sort; `particles` is not modified), so
+ *          the result is correct even when `particles` is not radius-sorted, e.g. in method 1,
+ *          which sorts at the start of a step and then integrates.
+ *
+ * @param particles    [in]  The main particle data array (need not be sorted by radius).
+ * @param npts         [in]  The total number of particles in the simulation.
+ * @param total_KE_out [out] Total kinetic energy.
+ * @param total_PE_out [out] Total potential energy.
+ *
+ * @note Particles with \f$r \le 10^{-12}\f$ are excluded from the sums (to avoid division by
+ *       zero) but their mass still counts as interior mass for others.
+ */
+static void calculate_system_energies(double** particles, int npts,
                                       double* total_KE_out, double* total_PE_out)
 {
+    const double *radii = particles[0];
+    const double *masses = particles[P_MASS];
+
     double KE_sum = 0.0;
-    double PE_sum = 0.0;
-
-    // This loop is parallelized with a reduction for summing energy components.
-    #pragma omp parallel for reduction(+:KE_sum, PE_sum)
+    #pragma omp parallel for reduction(+:KE_sum)
     for (int i = 0; i < npts; i++) {
-        double r = particles[0][i];
-        double v_rad = particles[1][i];
-        double L = particles[2][i];
-        double m_i = particles[8][i];
-
-        // Kinetic Energy per unit mass for particle i: 0.5 * (v_r^2 + v_t^2)
-        // where v_t = L / r.
-        if (r > 1e-12) { // Avoid division by zero for particles at the origin
-            double ke_per_mass = 0.5 * (v_rad * v_rad + (L * L) / (r * r));
-            KE_sum += ke_per_mass * m_i;
-        }
-
-        // Potential Energy per unit mass for particle i.
-        // The potential is due to the mass enclosed within its rank-ordered position.
-        double M_enclosed = g_mass_prefix_sum[i] + particles[8][i]; // prefix sum up to and including i
-
-
-        if (r > 1e-12) { // Avoid division by zero
-            double pe_per_mass = -(G_CONST * VEL_CONV_SQ) * M_enclosed / r;
-            PE_sum += pe_per_mass * m_i;
+        double r = radii[i];
+        if (r > 1e-12) {
+            double v_rad = particles[1][i];
+            double L = particles[2][i];
+            KE_sum += 0.5 * masses[i] * (v_rad * v_rad + (L * L) / (r * r));
         }
     }
 
-    // Scale the summed energies-per-unit-mass by the particle mass to get total energies.
+    // Rank the current radii (pointers into particles[0]; particles itself is untouched).
+    const double **order = (const double **)malloc((size_t)npts * sizeof(const double *));
+    if (!order) {
+        fprintf(stderr, "ERROR: Failed to allocate sort buffer in calculate_system_energies\n");
+        CLEAN_EXIT(1);
+    }
+    for (int i = 0; i < npts; i++)
+        order[i] = &radii[i];
+    quadsort(order, npts, sizeof(const double *), compare_double_ptr_values);
+
+    double PE_sum = 0.0;
+    double M_interior = 0.0;
+    for (int k = 0; k < npts; k++) {
+        int i = (int)(order[k] - radii);
+        double r = radii[i];
+        double m = masses[i];
+        if (r > 1e-12)
+            PE_sum += -(G_CONST * VEL_CONV_SQ) * m * M_interior / r;
+        M_interior += m;
+    }
+    free((void *)order);
+
+    // --star-softening: star pairs interact through -G m_i m_j / smax(r_i, r_j) instead of 1/max (see
+    // star_pair_smax); add the difference for the pairs closer than h in radius.
+    const double hs = star_soft_h_kpc();
+    if (g_star_substeps > 0 && hs > 0.0)
+    {
+        int ns = 0;
+        for (int i = 0; i < npts; i++)
+            if (particles[P_SPECIES][i] != 0) ns++;
+        int *st = (int *)malloc((size_t)(ns > 0 ? ns : 1) * sizeof(int));
+        if (!st) {
+            fprintf(stderr, "ERROR: Failed to allocate star buffer in calculate_system_energies\n");
+            CLEAN_EXIT(1);
+        }
+        ns = 0;
+        for (int i = 0; i < npts; i++)
+            if (particles[P_SPECIES][i] != 0) st[ns++] = i;
+        double dPE = 0.0;
+        for (int a = 0; a < ns; a++)
+            for (int b = a + 1; b < ns; b++)
+            {
+                double ra = radii[st[a]], rb = radii[st[b]];
+                if (fabs(ra - rb) >= hs)
+                    continue;
+                double mx = ra > rb ? ra : rb;
+                dPE += masses[st[a]] * masses[st[b]] * (1.0 / mx - 1.0 / star_pair_smax(ra, rb, hs, NULL));
+            }
+        free(st);
+        PE_sum += (G_CONST * VEL_CONV_SQ) * dPE;
+    }
+
     *total_KE_out = KE_sum;
     *total_PE_out = PE_sum;
 }
@@ -18811,46 +22609,54 @@ static void calculate_system_energies(double** particles, int npts, double delta
  * @details Implements a velocity-independent cross-section model where the opacity
  *          \f$\sigma/m = \kappa\f$ is constant. The function uses the global
  *          variable `g_sidm_kappa` for the opacity \f$\kappa\f$. The total cross-section
- *          \f$\sigma\f$ scales with the individual particle mass, \f$m_{particle}\f$, derived
- *          from the total `halo_mass_for_calc` and the number of particles `npts`.
+ *          \f$\sigma\f$ scales with the mass of the scattering partner,
+ *          \f$m_j\f$ = `particles[P_MASS][partner_idx]`, matching the pair rate
+ *          \f$\kappa\, m_j\, v_{rel}\f$ used by the SIDM scattering routines.
  *          The function includes unit conversions to return the cross-section
  *          in simulation units (kpc\f$^2\f$).
  *
  *          Unit Conversion Detail:
- *          \f$\kappa\f$ (cm²/g) \f$\times m_{particle}\f$ (\f$M_{\odot}\f$) \f$\rightarrow \sigma\f$ (kpc²)
+ *          \f$\kappa\f$ (cm²/g) \f$\times m_j\f$ (\f$M_{\odot}\f$) \f$\rightarrow \sigma\f$ (kpc²)
  *          The conversion factor is \f$2.089 \times 10^{-10} \text{ (kpc}^2 \text{ } M_{\odot}^{-1}) / (\text{cm}^2 \text{ g}^{-1})\f$.
  *
- * @param vrel                 [in] Relative velocity between particles (kpc/Myr). This
- *                             parameter is unused in the velocity-independent model.
- * @param npts                 [in] Total number of simulation particles, used for calculating \f$m_{particle}\f$.
- * @param halo_mass_for_calc [in] Total halo mass (\f$M_{\odot}\f$) for the active profile, used for \f$m_{particle}\f$.
- * @param rc_for_calc          [in] Scale radius (kpc) of the active profile. This
- *                             parameter is unused in the velocity-independent model.
- * @return double Total scattering cross-section \f$\sigma\f$ in kpc\f$^2\f$. Returns 0.0 if `npts` or
- *                the calculated `particle_mass_Msun` is non-positive.
+ * @param vrel        [in] Relative velocity between particles (kpc/Myr). This
+ *                    parameter is unused in the velocity-independent model.
+ * @param particles   [in] Particle array; the partner's mass is read from row P_MASS.
+ * @param partner_idx [in] Current index of the scattering partner in `particles`.
+ * @param rc_for_calc [in] Scale radius (kpc) of the active profile. This
+ *                    parameter is unused in the velocity-independent model.
+ * @return double Total scattering cross-section \f$\sigma\f$ in kpc\f$^2\f$. Returns 0.0 if the
+ *                partner's mass is non-positive.
+ *
+ * @note Not currently called: the scattering routines inline the same expression
+ *       (`sigma_per_mass * particles[P_MASS][j]`). Route them through this function when a
+ *       velocity-dependent cross-section is added.
  */
-double sigmatotal(double vrel, int npts, double halo_mass_for_calc, double rc_for_calc) {
+double sigmatotal(double vrel, double **particles, int partner_idx, double rc_for_calc) {
   (void)vrel; // Unused in velocity-independent model
   (void)rc_for_calc; // Unused in velocity-independent model
   double kappa = g_sidm_kappa; // Self-interaction opacity parameter (cm²/g)
-  // Ensure npts is positive to prevent division by zero or negative particle mass
-  if (npts <= 0) {
+  double partner_mass_Msun = particles[P_MASS][partner_idx];
+  if (partner_mass_Msun <= 0) {
     return 0.0;
   }
-  double particle_mass_Msun = halo_mass_for_calc / ((double)npts);
-  if (particle_mass_Msun <= 0) {
-    return 0.0;
-  }
-  return 2.089e-10 * kappa * particle_mass_Msun; // Cross-section (kpc²)
+  return 2.089e-10 * kappa * partner_mass_Msun; // Cross-section (kpc²)
 }
 
-static inline void perform_scatter_update(
+/**
+ * @brief Elastic two-body scatter: rotates the pair's relative velocity to polar angle theta
+ *        (cos theta = `costheta`) and azimuth `phif` about its old direction, in the centre-of-mass frame.
+ * @details Mass-weighted, so momentum and energy are conserved for unequal masses. Updates rows 1, 2,
+ *          5, 6 of both particles and flags them in g_particle_scatter_state. No-op for v_rel ~ 0.
+ *          perform_scatter_update (SIDM) draws an isotropic angle; perform_star_dm_rutherford a
+ *          Rutherford (Nanbu) one.
+ */
+static inline void scatter_update_with_angles(
     double **particles,
     int i,
     int j,
-    uint64_t seed,
-    int step,
-    int pid
+    double costheta,
+    double phif
 ) {
     // Get current velocities
     double cos_phi_i = particles[5][i];
@@ -18869,13 +22675,7 @@ static inline void perform_scatter_update(
 
     if (vrel < 1e-15) return;  // No scattering for zero relative velocity
 
-    // Generate scattering angles using deterministic hash
-    double u1 = get_deterministic_rand(seed, step, pid, 2);
-    double u2 = get_deterministic_rand(seed, step, pid, 3);
-
-    double costheta = 2.0 * u1 - 1.0;
     double sintheta = sqrt(fmax(0.0, 1.0 - costheta * costheta));
-    double phif = 2.0 * PI * u2;
     double cf = cos(phif);
     double sf = sin(phif);
 
@@ -18903,27 +22703,33 @@ static inline void perform_scatter_update(
     double rot_y = n1y * cf + n2y * sf;
     double rot_z = n1z * cf + n2z * sf;
 
-    // Construct final relative velocity change vector
-    double hvr = vrel * 0.5;
-    threevector Vrel_f_half = make_threevector(
-        hvr * (costheta * nx + sintheta * rot_x),
-        hvr * (costheta * ny + sintheta * rot_y),
-        hvr * (costheta * nz + sintheta * rot_z)
+    // Final relative velocity: same magnitude (elastic), isotropically redirected
+    threevector Vrel_f = make_threevector(
+        vrel * (costheta * nx + sintheta * rot_x),
+        vrel * (costheta * ny + sintheta * rot_y),
+        vrel * (costheta * nz + sintheta * rot_z)
     );
 
-    // Calculate center of mass velocity
-    threevector Vcm = make_threevector((Vi.x + Vj.x)/2.0, (Vi.y + Vj.y)/2.0, (Vi.z + Vj.z)/2.0);
+    // Centre-of-mass velocity and final velocities, weighted by each particle's own mass so the
+    // collision conserves momentum and energy for unequal masses (equal masses: weights 1/2).
+    double mi = particles[P_MASS][i];
+    double mj = particles[P_MASS][j];
+    double inv_mtot = 1.0 / (mi + mj);
+    double wi = mj * inv_mtot; // Share of the relative velocity carried by particle i
+    double wj = mi * inv_mtot; // Share carried by particle j
+    threevector Vcm = make_threevector((mi * Vi.x + mj * Vj.x) * inv_mtot,
+                                       (mi * Vi.y + mj * Vj.y) * inv_mtot,
+                                       (mi * Vi.z + mj * Vj.z) * inv_mtot);
 
-    // Calculate final velocities
     threevector Vi_final = make_threevector(
-        Vcm.x + Vrel_f_half.x,
-        Vcm.y + Vrel_f_half.y,
-        Vcm.z + Vrel_f_half.z
+        Vcm.x + wi * Vrel_f.x,
+        Vcm.y + wi * Vrel_f.y,
+        Vcm.z + wi * Vrel_f.z
     );
     threevector Vj_final = make_threevector(
-        Vcm.x - Vrel_f_half.x,
-        Vcm.y - Vrel_f_half.y,
-        Vcm.z - Vrel_f_half.z
+        Vcm.x - wj * Vrel_f.x,
+        Vcm.y - wj * Vrel_f.y,
+        Vcm.z - wj * Vrel_f.z
     );
 
     // Update particle i
@@ -18955,6 +22761,554 @@ static inline void perform_scatter_update(
         g_particle_scatter_state[(int)particles[3][i]] = 1;
         g_particle_scatter_state[(int)particles[3][j]] = 1;
     }
+}
+
+/**
+ * @brief SIDM scatter: isotropic angles from the deterministic hash (calls 2 and 3), then
+ *        scatter_update_with_angles.
+ */
+static inline void perform_scatter_update(
+    double **particles,
+    int i,
+    int j,
+    uint64_t seed,
+    int step,
+    int pid
+) {
+    // Generate scattering angles using deterministic hash
+    double u1 = get_deterministic_rand(seed, step, pid, 2);
+    double u2 = get_deterministic_rand(seed, step, pid, 3);
+
+    double costheta = 2.0 * u1 - 1.0;
+    double phif = 2.0 * PI * u2;
+    scatter_update_with_angles(particles, i, j, costheta, phif);
+}
+
+// =============================================================================
+// STAR-DARK MATTER RUTHERFORD SCATTERING (--star-dm-rutherford)
+// =============================================================================
+
+/**
+ * @brief Solves Nanbu's equation coth(A) - 1/A = exp(-s) for A (an inverse Langevin function).
+ * @details Nanbu (1997, Phys. Rev. E 55, 4642), the binary-collision method for Rutherford
+ *          (Coulomb) scattering: after a pair has accumulated s momentum-transfer collisions
+ *          (s = n sigma_T v_rel dt), its cumulative deflection chi, built from many small
+ *          Rutherford deflections, has density proportional to exp(A cos chi) on the sphere with
+ *          <cos chi> = coth(A) - 1/A = exp(-s). Small s gives A ~ 1/s (a small deflection),
+ *          large s gives A -> 0 (isotropic).
+ *
+ * @param s [in] Accumulated momentum-transfer collisions (> 0).
+ * @return A (>= 0).
+ */
+static double rutherford_nanbu_A(double s)
+{
+    if (s < 0.04)               // A > 25: coth(A) = 1 to double precision, so 1 - 1/A = exp(-s)
+        return -1.0 / expm1(-s);
+    double x = exp(-s);
+    if (x < 1e-6)               // L(A) = A/3 to double precision
+        return 3.0 * x;
+    double A = x * (3.0 - x * x) / (1.0 - x * x); // Cohen's approximation (within 5%), then Newton
+    for (int it = 0; it < 30; it++)
+    {
+        double L, dL;
+        if (A < 1e-2)
+        {
+            double A2 = A * A;
+            L = A * (1.0 / 3.0 - A2 * (1.0 / 45.0 - A2 * (2.0 / 945.0)));
+            dL = 1.0 / 3.0 - A2 * (1.0 / 15.0 - A2 * (2.0 / 189.0));
+        }
+        else
+        {
+            double sh = sinh(A);
+            L = 1.0 / tanh(A) - 1.0 / A;
+            dL = 1.0 / (A * A) - 1.0 / (sh * sh);
+        }
+        double A_new = A - (L - x) / dL;
+        if (!(A_new > 0.0))
+            A_new = 0.5 * A;
+        if (fabs(A_new - A) <= 1e-13 * A)
+            return A_new;
+        A = A_new;
+    }
+    return A;
+}
+
+/**
+ * @brief Samples cos chi from Nanbu's distribution, density proportional to exp(A cos chi).
+ * @details Inverse CDF cos chi = 1 + ln(1 + u (exp(-2A) - 1)) / A for uniform u in [0, 1),
+ *          written with log1p/expm1 so it is accurate for both tiny and huge A.
+ */
+static inline double rutherford_nanbu_costheta(double A, double u)
+{
+    if (A < 1e-8)
+        return 2.0 * u - 1.0; // isotropic
+    double c = 1.0 + log1p(u * expm1(-2.0 * A)) / A;
+    return c < -1.0 ? -1.0 : (c > 1.0 ? 1.0 : c);
+}
+
+// -----------------------------------------------------------------------------
+// SOFTENED RUTHERFORD CROSS-SECTION (--star-softening, --star-dm-softening)
+// -----------------------------------------------------------------------------
+// Errani et al. (2026) soften gravity with GADGET-4's spline kernel (Springel et al. 2001, eq. 71): support
+// h = 2.8 eps, exactly Newtonian beyond h; eps = 0.02 pc between stars and 0.1 pc between stars and dark matter.
+// Our defaults are smaller: --star-softening and --star-dm-softening both default to 1e-5 pc (since 2026-11-10).
+// A pair then interacts through U(r) = -G m_a m_b phi(r), phi = 1/r for r >= h, phi(0) = 2.8/h = 1/eps. In units
+// of h, with beta = b_90/h and u = b/h, the exact classical deflection of the relative orbit is
+//     chi(u, beta) = pi - 2 u int_rmin^inf dr / (r^2 sqrt(1 - u^2/r^2 + 2 beta phi(r))),
+// rmin the single root of r^2 (1 + 2 beta phi(r)) = u^2 (r^2 phi is increasing, so there is no orbiting), and
+//     sigma_T = 2 pi int_0^b_max b (1 - cos chi) db.
+// Orbits with u >= U* = sqrt(1 + 2 beta) keep rmin >= h and are exactly Keplerian, 1 - cos chi =
+// 2 beta^2 / (u^2 + beta^2). So with S(beta, U) = (1/beta^2) int_0^U u (1 - cos chi) du,
+//     sigma_T = 2 pi b_90^2 S(beta, U),                                          U = b_max/h <= U*,
+//     sigma_T = 2 pi b_90^2 [S(beta, U*) + ln((U^2 + beta^2) / (U*^2 + beta^2))], U > U*,
+// which is the point-mass 2 pi b_90^2 ln(1 + (b_max/b_90)^2) for h -> 0. S tends to a finite limit for
+// beta -> 0 (the impulse limit) and is tabulated once on a log grid in beta and in s = U/U*; outside the
+// table, beta < SOFT_BETA_MIN uses the SOFT_BETA_MIN row and beta > SOFT_BETA_MAX (slow pairs, where the core is
+// a negligible part of sigma_T) the point-mass formula. The simpler impulse form tan(chi/2) = (b_90/b) g(b/h)
+// was tried and rejected: it overestimates sigma_T by 30% to 30x for b_90 >~ 0.1 h, b_max <~ h, because the
+// particle speeds up inside the softened core. test/rutherford_softening_check.py checks this against an
+// independent Python integration.
+#define SOFT_BETA_MIN 1.0e-4    ///< Smallest tabulated b_90/h (S is flat below).
+#define SOFT_BETA_MAX 1.0e4     ///< Largest tabulated b_90/h (point-mass sigma_T above).
+#define SOFT_NBETA 321          ///< Table rows in beta, 40 per decade.
+#define SOFT_S_MIN 1.0e-3       ///< Smallest tabulated s = U/U*.
+#define SOFT_NS 193             ///< Table columns in s, 64 per decade.
+static double g_soft_lnS[SOFT_NBETA][SOFT_NS]; ///< ln S(beta, s U*).
+static int g_soft_table_ready = 0;
+
+/** @brief Spline-softened attractive potential per unit G m for h = 1 (GADGET's -W2): 1/r for r >= 1, 2.8 at 0. */
+static inline double spline_phi(double q)
+{
+    if (q >= 1.0)
+        return 1.0 / q;
+    double q2 = q * q;
+    if (q < 0.5)
+        return 2.8 - q2 * (16.0 / 3.0 - q2 * (9.6 - 6.4 * q));
+    return 3.2 - 1.0 / (15.0 * q) - q2 * (32.0 / 3.0 - q * (16.0 - q * (9.6 - 32.0 / 15.0 * q)));
+}
+
+/** @brief 1 - cos chi of the exact deflection at impact parameter u (units of h) and beta = b_90/h. */
+static double soft_one_minus_cos_chi(double u, double beta)
+{
+    // 8-point Gauss-Legendre on [-1, 1], 8 panels
+    static const double xg[4] = {0.1834346424956498, 0.5255324099163290, 0.7966664774136267, 0.9602898564975363};
+    static const double wg[4] = {0.3626837833783620, 0.3137066238173857, 0.2223810344533745, 0.1012285362903763};
+    const int npanel = 8;
+
+    // Turning point: r^2 (1 + 2 beta phi(r)) = u^2 is increasing in r, negative at 0 and >= 0 at r = u
+    double lo = 0.0, hi = u;
+    for (int it = 0; it < 100 && hi - lo > 1e-15 * hi; it++)
+    {
+        double r = 0.5 * (lo + hi);
+        if (r * r * (1.0 + 2.0 * beta * spline_phi(r)) < u * u)
+            lo = r;
+        else
+            hi = r;
+    }
+    double rmin = 0.5 * (lo + hi);
+    if (rmin >= 1.0) // Keplerian orbit
+        return 2.0 * beta * beta / (u * u + beta * beta);
+    double pmin = spline_phi(rmin), a = u / rmin;
+
+    // chi/2 = pi/2 - a int_0^1 dx / sqrt(G(x)), x = rmin/r, G(x) = a^2 (1 - x^2) + 2 beta (phi(rmin/x) - phi(rmin)).
+    // The leg r > 1 (x < rmin) is Keplerian, G = 1 + 2 beta y - u^2 y^2 with y = 1/r, and integrates to
+    // a I_out = arcsin((u^2 - beta)/q) + arcsin(beta/q), q = sqrt(beta^2 + u^2).
+    double q = sqrt(beta * beta + u * u), z = (u * u - beta) / q;
+    double aI = asin(z < -1.0 ? -1.0 : (z > 1.0 ? 1.0 : z)) + asin(beta / q);
+    // Core rmin < r < 1 in xi = ln(r/rmin) = L t^2 (L = ln(1/rmin)): the potential varies on scales of r, and t
+    // removes the turning-point singularity; dx = -x dxi.
+    double L = -log(rmin), I = 0.0, dt = 1.0 / npanel;
+    for (int p = 0; p < npanel; p++)
+    {
+        double c = (p + 0.5) * dt;
+        for (int n = 0; n < 4; n++)
+            for (int sgn = -1; sgn <= 1; sgn += 2)
+            {
+                double t = c + sgn * 0.5 * dt * xg[n], xi = L * t * t, x = exp(-xi);
+                double G = -a * a * expm1(-2.0 * xi) + 2.0 * beta * (spline_phi(rmin / x) - pmin);
+                I += wg[n] * 2.0 * L * t * x / sqrt(G);
+            }
+    }
+    aI += a * I * 0.5 * dt;
+    return 2.0 * sqr(sin(0.5 * PI - aI));
+}
+
+/** @brief Fills g_soft_lnS: S(beta, s U*) by Gauss-Legendre over u between successive s points. */
+static void build_soft_sigma_table(void)
+{
+    static const double xg[4] = {0.1834346424956498, 0.5255324099163290, 0.7966664774136267, 0.9602898564975363};
+    static const double wg[4] = {0.3626837833783620, 0.3137066238173857, 0.2223810344533745, 0.1012285362903763};
+    const double lb0 = log(SOFT_BETA_MIN), dlb = (log(SOFT_BETA_MAX) - lb0) / (SOFT_NBETA - 1);
+    const double ls0 = log(SOFT_S_MIN), dls = -ls0 / (SOFT_NS - 1);
+    for (int i = 0; i < SOFT_NBETA; i++)
+    {
+        double beta = exp(lb0 + i * dlb), Ustar = sqrt(1.0 + 2.0 * beta), S = 0.0, u_prev = 0.0;
+        for (int k = 0; k < SOFT_NS; k++)
+        {
+            double u_next = (k == SOFT_NS - 1) ? Ustar : Ustar * exp(ls0 + k * dls);
+            double c = 0.5 * (u_prev + u_next), hw = 0.5 * (u_next - u_prev);
+            for (int n = 0; n < 4; n++)
+                for (int sgn = -1; sgn <= 1; sgn += 2)
+                {
+                    double u = c + sgn * hw * xg[n];
+                    S += wg[n] * hw * u * soft_one_minus_cos_chi(u, beta) / (beta * beta);
+                }
+            g_soft_lnS[i][k] = log(S);
+            u_prev = u_next;
+        }
+    }
+    g_soft_table_ready = 1;
+}
+
+/**
+ * @brief Rutherford momentum-transfer cross-section of a spline-softened pair (kpc^2); see the block above.
+ * @param b90   [in] G (m_a + m_b) / v_rel^2 (kpc).
+ * @param b_max [in] Maximum impact parameter (kpc).
+ * @param h     [in] Kernel support 2.8 eps (kpc); 0 = point masses.
+ */
+static double rutherford_sigma_T(double b90, double b_max, double h)
+{
+    double beta = b90 / h;
+    if (!(h > 0.0) || beta > SOFT_BETA_MAX)
+        return 2.0 * PI * b90 * b90 * log1p(sqr(b_max / b90));
+    if (!g_soft_table_ready)
+        build_soft_sigma_table();
+
+    double U = b_max / h, Ustar = sqrt(1.0 + 2.0 * beta);
+    double s = (U < Ustar) ? U / Ustar : 1.0;
+    const double lb0 = log(SOFT_BETA_MIN), dlb = (log(SOFT_BETA_MAX) - lb0) / (SOFT_NBETA - 1);
+    const double ls0 = log(SOFT_S_MIN), dls = -ls0 / (SOFT_NS - 1);
+    double xb = (beta > SOFT_BETA_MIN) ? (log(beta) - lb0) / dlb : 0.0;
+    int ib = (int)xb;
+    if (ib > SOFT_NBETA - 2) ib = SOFT_NBETA - 2;
+    double fb = xb - ib;
+    // Bilinear in (ln beta, ln s); below SOFT_S_MIN the first interval's power law is extrapolated
+    double xs = (log(s) - ls0) / dls;
+    int is = (xs < 0.0) ? 0 : (int)xs;
+    if (is > SOFT_NS - 2) is = SOFT_NS - 2;
+    double fs = xs - is;
+    double l0 = g_soft_lnS[ib][is] + fs * (g_soft_lnS[ib][is + 1] - g_soft_lnS[ib][is]);
+    double l1 = g_soft_lnS[ib + 1][is] + fs * (g_soft_lnS[ib + 1][is + 1] - g_soft_lnS[ib + 1][is]);
+    double S = exp(l0 + fb * (l1 - l0));
+    if (U > Ustar)
+        S += log((U * U + beta * beta) / (Ustar * Ustar + beta * beta));
+    return 2.0 * PI * b90 * b90 * S;
+}
+
+/**
+ * @brief Star-dark-matter gravitational (Rutherford) scattering for one timestep (`--star-dm-rutherford`).
+ * @details A collisional replacement for the Chandrasekhar drag of --drag. Dynamical friction is the
+ *          cumulative effect of two-body gravitational (Rutherford) encounters between a star and
+ *          the dark matter; here they are sampled as binary collisions with the SIDM machinery
+ *          (radius-sorted rank neighbours, a shell density, and the elastic centre-of-mass rotation
+ *          of scatter_update_with_angles with the persistent phi). Every collision conserves energy
+ *          and momentum, so the energy a star loses goes into its dark-matter partners directly.
+ *
+ *          For each star (species != 0), in rank order:
+ *          1. Its n = g_star_dm_neighbours (--star-dm-neighbours, default 10) nearest dark-matter rank
+ *             neighbours, taken
+ *             alternately outward and inward (other stars are skipped), as in build_drag_snapshots.
+ *          2. Their number density n_DM = (n - 1) / V over the shell V = 4 pi/3 (r_hi^3 - r_lo^3)
+ *             they span; each neighbour stands for density n_DM / n. Every star-DM pair is visited
+ *             only from the star, so SIDM's 1/2 double-counting factor does not appear.
+ *          3. Per pair, the Rutherford momentum-transfer cross-section
+ *             sigma_T = 2 pi b_90^2 ln(1 + (b_max/b_90)^2) = 4 pi b_90^2 ln Lambda,
+ *             b_90 = G (m_star + m_DM) / v_rel^2, with the Coulomb logarithm of --drag and its
+ *             b_max = min(r, rho/|drho/dr|) (drag_bmax). As v_rel -> 0 it tends to 2 pi b_max^2.
+ *             With --star-dm-softening eps > 0 (default 1e-5 pc since 2026-11-10; Errani's eps_DM is 0.1 pc)
+ *             the pair is a spline-softened
+ *             point mass and sigma_T is rutherford_sigma_T's, smaller for impact parameters below 2.8 eps.
+ *             With --star-dm-bmax-floor > 0, b_max is at least that length: drag_bmax falls to r inside
+ *             the core, so without a floor sigma_T vanishes once r <~ 2.8 eps.
+ *          4. The pair accumulates s = (n_DM / n) sigma_T v_rel dt momentum-transfer collisions this
+ *             step. Rutherford scattering is dominated by small deflections, so rather than rare
+ *             isotropic events the pair's relative velocity is rotated every step by the cumulative
+ *             angle of Nanbu's method (rutherford_nanbu_A): <1 - cos chi> = 1 - exp(-s) and
+ *             <sin^2 chi> ~ 2 s for small s, as for Rutherford's small-angle scattering, and
+ *             isotropic for large s. Summed over the neighbours, a heavy star feels the mean
+ *             deceleration 4 pi G^2 m_star rho ln Lambda / v^2 (Chandrasekhar), averaged over the
+ *             neighbours' actual velocities instead of an assumed Maxwellian, plus the matching
+ *             diffusion.
+ *
+ *          Stars are few, so the pass is serial; a star's later pairs see its updated velocity.
+ *          Star-star pairs are not scattered.
+ *
+ * @param particles    [in,out] Radius-sorted particle array; velocities (rows 1, 2, 5, 6) are updated.
+ * @param npts         [in] Number of particles.
+ * @param dt           [in] Timestep (Myr).
+ * @param timestep_idx [in] Step index for the deterministic random numbers.
+ * @param seed         [in] SIDM seed (salted with STAR_DM_SEED_SALT, independent of the --sidm stream).
+ * @param s_sum_out    [out] Sum of s over all pairs this step.
+ * @param dE_out       [out] Kinetic energy the stars lost this step (Msun kpc^2/Myr^2).
+ * @note Needs the dark-matter-only smooth table (build_dm_smooth_table) of this step's order for b_max.
+ */
+static void perform_star_dm_rutherford(double **particles, int npts, double dt, int timestep_idx,
+                                       uint64_t seed, double *s_sum_out, double *dE_out)
+{
+    const int nscat = g_star_dm_neighbours;
+    const double Gc = VEL_CONV_SQ * G_CONST;
+    const uint64_t rseed = seed ^ STAR_DM_SEED_SALT;
+    const double h_soft = STAR_SOFT_KERNEL * g_star_dm_softening_pc * 1.0e-3; // --star-dm-softening support (kpc)
+    const double bmax_floor = g_star_dm_bmax_floor_pc * 1.0e-3;                 // --star-dm-bmax-floor (kpc)
+    int nbr[nscat > 0 ? nscat : 1];
+    double s_sum = 0.0, dE = 0.0;
+
+    for (int i = 0; i < npts; i++)
+    {
+        if (particles[P_SPECIES][i] == 0)
+            continue;
+        double r_i = particles[0][i];
+        if (!(r_i > 0.0))
+            continue;
+
+        // Nearest dark-matter rank neighbours, alternating outward and inward
+        int q_hi = i + 1, q_lo = i - 1, n = 0, outward = 1;
+        double r_lo = r_i, r_hi = r_i;
+        while (n < nscat && (q_hi < npts || q_lo >= 0))
+        {
+            int q = ((outward && q_hi < npts) || q_lo < 0) ? q_hi++ : q_lo--;
+            outward = !outward;
+            if (particles[P_SPECIES][q] == 0)
+            {
+                nbr[n++] = q;
+                if (particles[0][q] < r_lo) r_lo = particles[0][q];
+                if (particles[0][q] > r_hi) r_hi = particles[0][q];
+            }
+        }
+        double vol = (4.0 * PI / 3.0) * (r_hi * r_hi * r_hi - r_lo * r_lo * r_lo);
+        if (n < 2 || !(vol > 0.0))
+            continue;
+        double n_pair = (double)(n - 1) / (vol * n); // Density each neighbour stands for (1/kpc^3)
+
+        double m_s = particles[P_MASS][i];
+        double b_max = fmax(drag_bmax(r_i, g_dm_idx_of_rank[i]), bmax_floor);
+        int star_id = (int)particles[3][i];
+        double v2_before = sqr(particles[1][i]) + sqr(particles[2][i] / r_i);
+
+        for (int k = 0; k < n; k++)
+        {
+            int j = nbr[k];
+            double r_j = particles[0][j];
+            if (!(r_j > 0.0))
+                continue;
+
+            // Relative velocity, built as in scatter_update_with_angles
+            double vperp_i = particles[2][i] / r_i;
+            double vperp_j = particles[2][j] / r_j;
+            double dx = vperp_i * particles[5][i] - vperp_j * particles[5][j];
+            double dy = vperp_i * particles[6][i] - vperp_j * particles[6][j];
+            double dz = particles[1][i] - particles[1][j];
+            double v2 = dx * dx + dy * dy + dz * dz;
+            if (!(v2 > 1e-30))
+                continue;
+            double vrel = sqrt(v2);
+
+            double b90 = Gc * (m_s + particles[P_MASS][j]) / v2;
+            double sigma_T = rutherford_sigma_T(b90, b_max, h_soft);
+            double s = n_pair * sigma_T * vrel * dt;
+            if (!(s > 0.0))
+                continue;
+            s_sum += s;
+            {
+                int sp_i = (int)particles[P_SPECIES][i];
+                double *sat = g_star_dm_sat[sp_i < 3 ? sp_i : 3];
+                sat[0] += s;
+                sat[1] += -expm1(-s);
+                if (s > 0.1) sat[2] += s;
+                sat[3] += 1.0;
+            }
+
+            double A = rutherford_nanbu_A(s);
+            double costheta = rutherford_nanbu_costheta(A, get_deterministic_rand(rseed, timestep_idx, star_id, 2 * k));
+            double phif = 2.0 * PI * get_deterministic_rand(rseed, timestep_idx, star_id, 2 * k + 1);
+            scatter_update_with_angles(particles, i, j, costheta, phif);
+        }
+
+        double v2_after = sqr(particles[1][i]) + sqr(particles[2][i] / r_i);
+        dE += 0.5 * m_s * (v2_before - v2_after);
+    }
+
+    *s_sum_out = s_sum;
+    *dE_out = dE;
+}
+
+/**
+ * @brief 1 if the SIDM (kappa) pass must not scatter particle i with partner j.
+ * @details --star-dm-rutherford: stars scatter only gravitationally, so no star partner (a star i
+ *          is skipped by the callers). --star-star-rutherford: pairs of two stars of species 1-9 are
+ *          scattered by perform_star_star_rutherford instead.
+ */
+static inline int sidm_pair_blocked(double **particles, int i, int j)
+{
+    int star_i = particles[P_SPECIES][i] != 0;
+    int star_j = particles[P_SPECIES][j] != 0;
+    if (g_star_dm_rutherford && star_j)
+        return 1;
+    if (g_star_star_rutherford && star_i && star_j &&
+        star_star_species(particles[P_SPECIES][i]) && star_star_species(particles[P_SPECIES][j]))
+        return 1;
+    return 0;
+}
+
+/**
+ * @brief Star-star gravitational (Rutherford) scattering for one timestep (`--star-star-rutherford`).
+ * @details Two-body relaxation among the stars, which the spherical mean field does not contain.
+ *          Runs once per step on the radius-sorted particles, after --star-dm-rutherford and before
+ *          the integration (and before --star-substeps). The participating stars are the particles
+ *          of species 1-9 (star_star_species); any two of them interact, whatever their species.
+ *          Particles of other species are skipped entirely: the rank neighbours below are counted
+ *          among the participating stars only.
+ *
+ *          The stars are taken in rank order, a = 0..ns-1. For each star a:
+ *          1. Its partners are the stars b != a with |a - b| <= k (k = --star-star-neighbours), up to
+ *             k on each side, fewer at the ends of the star list.
+ *          2. The density kernel is the shell V = 4 pi/3 (r_hi^3 - r_lo^3) spanned by star a and its
+ *             partners: the c + 1 stars in it give a star density c / V, so each partner stands for
+ *             density 1 / V.
+ *          3. Per pair, the cross-section of perform_star_dm_rutherford with both masses in it:
+ *             sigma_T = 2 pi b_90^2 ln(1 + (b_max/b_90)^2), b_90 = G (m_a + m_b) / v_rel^2,
+ *             b_max = drag_bmax at r_a, softened with --star-softening's eps (default 1e-5 pc since
+ *             2026-11-10; Errani's eps_* is 0.02 pc; rutherford_sigma_T).
+ *          4. The window |a - b| <= k is symmetric, so every pair is visited twice, once from each
+ *             star (with each star's own V and b_max). Each visit therefore takes half the rate,
+ *             s = (1/2) (1/V) sigma_T v_rel dt, and rotates the pair's relative velocity by Nanbu's
+ *             cumulative angle for that s (rutherford_nanbu_A), through scatter_update_with_angles.
+ *
+ *          Every visit is an elastic, mass-weighted centre-of-mass rotation, so energy and momentum
+ *          are conserved exactly; only energy is exchanged between the stars (and species). Random
+ *          numbers come from the star-star seed, keyed on (step, visiting star ID, partner ID), so
+ *          a run is reproducible and independent of the --sidm and --star-dm-rutherford streams.
+ *          Serial: a few hundred stars times 2k partners is negligible next to the integration.
+ *
+ *          Diagnostics (g_ssr): sum of s and of 1 - e^-s per species pair, visits with s > 1, the
+ *          kinetic energy each species gains, the largest per-step relative energy error, wall time.
+ *
+ * @param particles    [in,out] Radius-sorted particle array; velocities (rows 1, 2, 5, 6) of stars are updated.
+ * @param npts         [in] Number of particles.
+ * @param dt           [in] Timestep (Myr).
+ * @param timestep_idx [in] Step index for the deterministic random numbers.
+ * @param seed         [in] Star-star seed (--star-star-seed, or master seed + 3).
+ * @note Needs the dark-matter-only smooth table (build_dm_smooth_table) of this step's order for b_max.
+ */
+static void perform_star_star_rutherford(double **particles, int npts, double dt, int timestep_idx, uint64_t seed)
+{
+    const double t0 = omp_get_wtime();
+    const int k = g_star_star_neighbours;
+    const double Gc = VEL_CONV_SQ * G_CONST;
+    const double h_soft = star_soft_h_kpc(); // --star-softening support (kpc)
+    int *rank = g_star_star_rank;
+
+    // Participating stars (species 1-9) in rank order, and their kinetic energy per species
+    int ns = 0;
+    double K_before[STAR_MAX_SPECIES + 1] = {0.0};
+    for (int i = 0; i < npts && ns < g_star_star_nstars; i++)
+    {
+        if (!star_star_species(particles[P_SPECIES][i]))
+            continue;
+        int sp = (int)particles[P_SPECIES][i];
+        rank[ns++] = i;
+        double r = particles[0][i];
+        if (r > 0.0)
+            K_before[sp] += 0.5 * particles[P_MASS][i] * (sqr(particles[1][i]) + sqr(particles[2][i] / r));
+    }
+
+    double s_step = 0.0;
+    long long visits = 0;
+    for (int a = 0; a < ns; a++)
+    {
+        int i = rank[a];
+        double r_i = particles[0][i];
+        if (!(r_i > 0.0))
+            continue;
+        int lo = (a - k > 0) ? a - k : 0;
+        int hi = (a + k < ns - 1) ? a + k : ns - 1;
+        if (hi <= lo)
+            continue;
+        double r_lo = particles[0][rank[lo]];
+        double r_hi = particles[0][rank[hi]];
+        double vol = (4.0 * PI / 3.0) * (r_hi * r_hi * r_hi - r_lo * r_lo * r_lo);
+        if (!(vol > 0.0))
+            continue;
+        double n_pair = 1.0 / vol; // Density each partner stands for (1/kpc^3)
+
+        double m_i = particles[P_MASS][i];
+        double b_max = drag_bmax(r_i, g_dm_idx_of_rank[i]);
+        int id_i = (int)particles[3][i];
+        int sp_i = (int)particles[P_SPECIES][i];
+
+        for (int b = lo; b <= hi; b++)
+        {
+            if (b == a)
+                continue;
+            int j = rank[b];
+            double r_j = particles[0][j];
+            if (!(r_j > 0.0))
+                continue;
+
+            // Relative velocity, built as in scatter_update_with_angles
+            double vperp_i = particles[2][i] / r_i;
+            double vperp_j = particles[2][j] / r_j;
+            double dx = vperp_i * particles[5][i] - vperp_j * particles[5][j];
+            double dy = vperp_i * particles[6][i] - vperp_j * particles[6][j];
+            double dz = particles[1][i] - particles[1][j];
+            double v2 = dx * dx + dy * dy + dz * dz;
+            if (!(v2 > 1e-30))
+                continue;
+            double vrel = sqrt(v2);
+
+            double b90 = Gc * (m_i + particles[P_MASS][j]) / v2;
+            double sigma_T = rutherford_sigma_T(b90, b_max, h_soft);
+            double s = 0.5 * n_pair * sigma_T * vrel * dt; // 1/2: the pair is also visited from star b
+            if (!(s > 0.0))
+                continue;
+            s_step += s;
+            visits++;
+            {
+                int sp_j = (int)particles[P_SPECIES][j];
+                int p = sp_i < sp_j ? sp_i : sp_j, q = sp_i < sp_j ? sp_j : sp_i;
+                double *sat = g_ssr.pair_sat[p][q];
+                sat[0] += s;
+                sat[1] += -expm1(-s);
+                sat[2] += 1.0;
+                if (s > 1.0)
+                    g_ssr.n_big_s += 1.0;
+            }
+
+            int id_j = (int)particles[3][j];
+            double A = rutherford_nanbu_A(s);
+            double costheta = rutherford_nanbu_costheta(A, get_deterministic_rand(seed, timestep_idx, id_i, 2 * id_j));
+            double phif = 2.0 * PI * get_deterministic_rand(seed, timestep_idx, id_i, 2 * id_j + 1);
+            scatter_update_with_angles(particles, i, j, costheta, phif);
+        }
+    }
+
+    // Energy bookkeeping: exchange between species, and the (round-off) total error
+    double K_after[STAR_MAX_SPECIES + 1] = {0.0};
+    for (int a = 0; a < ns; a++)
+    {
+        int i = rank[a];
+        double r = particles[0][i];
+        if (r > 0.0)
+            K_after[(int)particles[P_SPECIES][i]] += 0.5 * particles[P_MASS][i] * (sqr(particles[1][i]) + sqr(particles[2][i] / r));
+    }
+    double K_tot = 0.0, dK_tot = 0.0;
+    for (int sp = 1; sp <= STAR_MAX_SPECIES; sp++)
+    {
+        double dK = K_after[sp] - K_before[sp];
+        g_ssr.dK_species[sp] += dK;
+        dK_tot += dK;
+        K_tot += K_before[sp];
+    }
+    double rel = (K_tot > 0.0) ? fabs(dK_tot) / K_tot : 0.0;
+    if (rel > g_ssr.max_rel_dE)
+        g_ssr.max_rel_dE = rel;
+    g_ssr.s_total += s_step;
+    g_ssr.steps++;
+    g_ssr.time_total += omp_get_wtime() - t0;
+
+    if (g_doDebug)
+        log_message("DEBUG", "Star-star Rutherford: %lld visits, sum s = %.6e, |dK|/K = %.3e this step",
+                    visits, s_step, rel);
 }
 /**
  * @brief Executes self-interacting dark matter (SIDM) scattering for one simulation timestep (Serial version).
@@ -18997,26 +23351,26 @@ static inline void perform_scatter_update(
  * @param current_time          [in] Current simulation time (Myr). Marked `unused` but available.
  * @param rng                   [in] GSL random number generator instance for all stochastic processes.
  * @param Nscatter_total_step   [out] Pointer to a long long to accumulate total scattering events this timestep.
- * @param halo_mass_for_sidm    [in] Total halo mass (\f$M_{\odot}\f$) for the active profile, passed to `sigmatotal`.
- * @param rc_for_sidm           [in] Scale radius (kpc) for the active profile, passed to `sigmatotal`.
+ * @param rc_for_sidm           [in] Scale radius (kpc) for the active profile (unused in the velocity-independent model).
  * @param current_scatter_counts [in,out] Per-particle scatter count array for tracking (can be NULL).
  */
 
-void perform_sidm_scattering_serial(double **particles, int npts, double dt, int timestep_idx, uint64_t sidm_seed, long long *Nscatter_total_step, double halo_mass_for_sidm, double rc_for_sidm, int *current_scatter_counts) {
+void perform_sidm_scattering_serial(double **particles, int npts, double dt, int timestep_idx, uint64_t sidm_seed, long long *Nscatter_total_step, double rc_for_sidm, int *current_scatter_counts) {
     (void)rc_for_sidm;
     long long Nscatters_this_call = 0;
     int i;
 
     extern int g_sidm_max_interaction_range;
 
-    // Pre-calculate sigma (velocity-independent for current cross-section model)
-    double sigma_precalc = 0.0;
-    if (npts > 0) {
-        double particle_mass_Msun = halo_mass_for_sidm / ((double)npts);
-        sigma_precalc = 2.089e-10 * g_sidm_kappa * particle_mass_Msun;
-    }
+    // Cross-section per unit mass (velocity-independent model): a partner of mass m_j presents a
+    // cross-section kappa * m_j, so the pair rate is kappa * m_j * v_rel per unit shell volume.
+    // 2.089e-10 converts kappa [cm^2/g] * mass [Msun] to kpc^2.
+    const double sigma_per_mass = 2.089e-10 * g_sidm_kappa;
 
     for (i = 0; i < npts - 1; i++) {
+        // --star-dm-rutherford: stars scatter only gravitationally (perform_star_dm_rutherford)
+        if (g_star_dm_rutherford && particles[P_SPECIES][i] != 0) continue;
+
         int nscat = g_sidm_max_interaction_range;
         if (npts - 1 - i < nscat) nscat = npts - 1 - i;
         if (nscat <= 0) continue;
@@ -19048,7 +23402,8 @@ void perform_sidm_scattering_serial(double **particles, int npts, double dt, int
             double v_rel_tan_sq = sqr(v_ti) + sqr(v_tm) - 2.0 * v_ti * v_tm * cos_alpha;
             double vrel_val = sqrt(v_rel_rad_sq + v_rel_tan_sq);
 
-            double rate = sigma_precalc * vrel_val;
+            double rate = sigma_per_mass * particles[P_MASS][partner_idx] * vrel_val;
+            if (sidm_pair_blocked(particles, i, partner_idx)) rate = 0.0;
             partialprobability[m] = rate;
             probability_sum_term += rate;
         }
@@ -19119,7 +23474,8 @@ void perform_sidm_scattering_serial(double **particles, int npts, double dt, int
             }
 
             int actual_partner_idx = i + m_scatter;
-            if (actual_partner_idx >= npts) {
+            if (actual_partner_idx >= npts ||
+                sidm_pair_blocked(particles, i, actual_partner_idx)) {
                 Nscatters_this_call--;
                 continue;
             }
@@ -19227,8 +23583,7 @@ void perform_sidm_scattering_serial(double **particles, int npts, double dt, int
  * @param num_threads_for_rng   [in] The number of allocated RNGs in `rng_per_thread_list` (equals max threads).
  * @param Nscatter_total_step   [out] Pointer to a long long to accumulate the total number of scatter events
  *                              that occurred in this timestep.
- * @param halo_mass_for_sidm    [in] Total halo mass (\f$M_{\odot}\f$) for the active profile, passed to `sigmatotal`.
- * @param rc_for_sidm           [in] Scale radius (kpc) for the active profile, passed to `sigmatotal`.
+ * @param rc_for_sidm           [in] Scale radius (kpc) for the active profile (unused in the velocity-independent model).
  * @param current_scatter_counts [in,out] Per-particle scatter count array for tracking (can be NULL).
  */
 // Structure for reorganized particle data
@@ -19239,7 +23594,6 @@ void perform_sidm_scattering_parallel_graphcolor(
     int timestep_idx,
     uint64_t sidm_seed,
     long long *Nscatter_total_step,
-    double halo_mass_for_sidm,
     double rc_for_sidm,
     int *current_scatter_counts
 ) {
@@ -19248,12 +23602,10 @@ void perform_sidm_scattering_parallel_graphcolor(
     extern int g_sidm_max_interaction_range;
     const int NUM_COLORS = g_sidm_max_interaction_range + 1;
 
-    // Pre-calculate sigma (velocity-independent for current cross-section model)
-    double sigma_precalc = 0.0;
-    if (npts > 0) {
-        double particle_mass_Msun = halo_mass_for_sidm / ((double)npts);
-        sigma_precalc = 2.089e-10 * g_sidm_kappa * particle_mass_Msun;
-    }
+    // Cross-section per unit mass (velocity-independent model): a partner of mass m_j presents a
+    // cross-section kappa * m_j, so the pair rate is kappa * m_j * v_rel per unit shell volume.
+    // 2.089e-10 converts kappa [cm^2/g] * mass [Msun] to kpc^2.
+    const double sigma_per_mass = 2.089e-10 * g_sidm_kappa;
 
     // Process each color sequentially
     for (int color = 0; color < NUM_COLORS; color++) {
@@ -19273,6 +23625,8 @@ void perform_sidm_scattering_parallel_graphcolor(
             #pragma omp for schedule(guided)
             for (int i = color; i < npts; i += NUM_COLORS) {
                 if (i >= npts - 1) continue;
+                // --star-dm-rutherford: stars scatter only gravitationally (perform_star_dm_rutherford)
+                if (g_star_dm_rutherford && particles[P_SPECIES][i] != 0) continue;
 
                 // Determine how many neighbors to check
                 int nscat = g_sidm_max_interaction_range;
@@ -19304,7 +23658,8 @@ void perform_sidm_scattering_parallel_graphcolor(
                     double vrel = sqrt(dotproduct(Vrel, Vrel));
 
                     // Calculate partial probability (cross section * relative velocity)
-                    double rate = sigma_precalc * vrel;
+                    double rate = sigma_per_mass * particles[P_MASS][j] * vrel;
+                    if (sidm_pair_blocked(particles, i, j)) rate = 0.0;
                     partialprobability[m] = rate;
                     probability_sum += rate;
                 }
@@ -19354,6 +23709,7 @@ void perform_sidm_scattering_parallel_graphcolor(
 
                     int j = i + m_scatter;
                     if (j >= npts) continue;  // Safety check
+                    if (sidm_pair_blocked(particles, i, j)) continue;
 
                     // Perform scatter update using deterministic RNG
                     perform_scatter_update(particles, i, j, sidm_seed, timestep_idx, part_id);
