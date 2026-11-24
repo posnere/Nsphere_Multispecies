@@ -666,6 +666,9 @@ static int g_star_dm_softening_provided = 0; ///< Flag: 1 if --star-dm-softening
 static double g_star_dm_bmax_floor_pc = 0.0; ///< --star-dm-bmax-floor (pc): lower bound on --star-dm-rutherford's b_max,
                                              ///< which otherwise falls to r near the centre (drag_bmax). 0 = off.
 static int g_star_dm_bmax_floor_provided = 0; ///< Flag: 1 if --star-dm-bmax-floor was given.
+static int g_bmax_r = 0; ///< --bmax-r: Coulomb-logarithm b_max = r (distance from the centre) in drag_bmax, for
+                         ///< --drag, --star-dm-rutherford and --star-star-rutherford, instead of
+                         ///< min(r, rho/|drho/dr|). 0 = off (Petts et al. 2015 form, the default).
 
 /**
  * @brief Chandrasekhar dynamical friction (drag) on stars (method 1 only, `--drag`).
@@ -2852,12 +2855,16 @@ static inline double dm_table_mass(double r, int hint)
  *          exactly f^gamma, so gamma = ln(rho_out/rho_in)/ln f and rho/|drho/dr| = r/|gamma|.
  *          Each shell holds many more particles than a knot interval, so the slope is not
  *          dominated by particle noise. Falls back to b_max = r if either shell is empty.
+ *          With --bmax-r it returns r (Hashimoto, Funato & Makino 2003: ln Lambda = ln(R / b_min)),
+ *          dropping the rho/|drho/dr| reduction, which in a truncated cusp is largest where the stars start.
  *
  * @param r      [in] Radius (kpc).
  * @param dm_idx [in] Number of dark-matter particles below r (search hint).
  */
 static inline double drag_bmax(double r, int dm_idx)
 {
+    if (g_bmax_r)
+        return r;
     const double f = DRAG_BMAX_SHELL_FACTOR;
     int hint = dm_idx / g_dm_table_k;
     double m_in = dm_table_mass(r / f, hint);
@@ -3577,6 +3584,9 @@ static void printUsage(const char *prog)
             "  --star-dm-bmax-floor <pc>     [Default 0 = off] With --star-dm-rutherford: lower bound on b_max,\n"
             "                                     which otherwise shrinks to r near the centre. Keeps\n"
             "                                     ln(b_max / 2.8 eps) from vanishing for stars inside the core.\n"
+            "  --bmax-r                      [Default Off] Coulomb-logarithm maximum impact parameter b_max = r\n"
+            "                                     (distance from the centre) instead of min(r, rho/|drho/dr|),\n"
+            "                                     for --drag, --star-dm-rutherford and --star-star-rutherford.\n"
             "  --star-star-rutherford       [Default Off] For --method 1: once per step, stars of all species\n"
             "                                     1-9 scatter elastically off each other (any species pair) with\n"
             "                                     the Rutherford cross-section of --star-dm-rutherford, b_90 =\n"
@@ -10515,6 +10525,11 @@ printf("  \n");
             }
             g_star_dm_bmax_floor_provided = 1;
         }
+        else if (strcmp(argv[i], "--bmax-r") == 0)
+        {
+            /** @note Coulomb-logarithm b_max = r in drag_bmax (all friction/scattering channels). */
+            g_bmax_r = 1;
+        }
         else if (strcmp(argv[i], "--star-softening") == 0)
         {
             /** @note Star-star softening length eps in pc (0 = off); see star_pair_smax. */
@@ -10763,6 +10778,12 @@ printf("  \n");
     }
     if (g_star_dm_bmax_floor_provided && !g_star_dm_rutherford) {
         errorAndExit("--star-dm-bmax-floor requires --star-dm-rutherford", NULL, argv[0]);
+    }
+    if (g_bmax_r) {
+        if (!g_enable_drag_force && !g_star_dm_rutherford && !g_star_star_rutherford)
+            errorAndExit("--bmax-r requires --drag, --star-dm-rutherford or --star-star-rutherford", NULL, argv[0]);
+        printf("Coulomb-logarithm b_max = r (distance from the centre) instead of min(r, rho/|drho/dr|) (--bmax-r).\n");
+        log_message("INFO", "Coulomb logarithm b_max = r (--bmax-r)");
     }
     if (g_star_dm_rutherford) {
         printf("Star-DM Rutherford scattering enabled (%d dark-matter rank neighbours per star, softening eps = %g pc, b_max floor = %g pc).\n",
